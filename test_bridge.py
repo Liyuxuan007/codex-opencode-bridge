@@ -71,7 +71,11 @@ class QueueTests(unittest.TestCase):
         broker.store = self.store
         broker.notify = lambda: None
         broker.prepare_workspace = lambda row, item: row['workspace']
-        with patch.object(bridge, 'oc', side_effect=[[], {'ses_test': {'type': 'idle'}}, None]):
+        def native(path, *args, **kwargs):
+            if path == '/session/status':
+                return {'ses_test': {'type': 'idle'}}
+            return [] if '/message' in path else True
+        with patch.object(bridge, 'oc', side_effect=native):
             broker.run(first, recovering=True)
         self.assertEqual(self.store.get(first)['status'], 'failed')
 
@@ -87,7 +91,7 @@ class QueueTests(unittest.TestCase):
             broker.run(first, recovering=True)
         self.assertEqual(api.call_args_list[0], call('/session/ses_test/abort', 'POST', {}, '/test/project'))
         self.assertFalse(any('/prompt_async' in str(call) for call in api.call_args_list))
-        self.assertEqual(self.store.get(first)['status'], 'failed')
+        self.assertEqual(self.store.get(first)['status'], 'attention_required')
 
     def test_path_traversal_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -176,7 +180,11 @@ class QueueTests(unittest.TestCase):
         self.store.update(first, session_id='ses_test', workspace='/test', status='running', started=bridge.time.time()-60)
         broker = object.__new__(bridge.Broker); broker.store = self.store; broker.notify = lambda: None
         broker.prepare_workspace = lambda row, item: row['workspace']
-        with patch.object(bridge, 'oc', side_effect=[None, []]), patch.object(bridge, 'git', return_value=''):
+        def native(path, *args, **kwargs):
+            if path == '/session/status':
+                return {'ses_test': {'type': 'idle'}}
+            return [] if '/message' in path else True
+        with patch.object(bridge, 'oc', side_effect=native), patch.object(bridge, 'git', return_value=''):
             broker.run(first)
         row = self.store.get(first)
         self.assertEqual(row['status'], 'timed_out')

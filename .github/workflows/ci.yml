@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Offline bridge tests
-        run: python3 -m unittest test_bridge -v
+        run: python3 -m unittest discover -s . -p 'test_*.py' -v
       - name: Publication policy tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
       - name: Check tracked file policy

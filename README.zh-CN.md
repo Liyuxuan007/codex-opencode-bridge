@@ -11,7 +11,7 @@
 
 要求 WSL2、Python 3.10+、Git、已登录的 OpenCode CLI，以及 Windows Codex CLI。
 已验证环境：Ubuntu 24.04、OpenCode 1.19.2、Codex CLI 0.163.0-alpha.10.2。
-桥接版本 1.1.0。默认模型示例为 `opencode-go/deepseek-v4.1-flash`，具体 revision
+桥接版本 1.2.0。默认模型示例为 `opencode-go/deepseek-v4.1-flash`，具体 revision
 由提供商管理；安装前确认账户可用模型。代码不包含模型权重、数据集或向量库。
 
 1. 克隆仓库到 WSL 可访问的位置。
@@ -37,6 +37,25 @@ Codex 配置并注册 MCP；重新打开 Codex 聊天即可加载工具。升级
 `CODEX_OPENCODE_STATE` 环境变量，程序不会自动读取 `.env`，不要在这里填 API key。
 
 ## 使用与效率
+
+1.2.0 新增受控模型目录刷新、执行配置、provider/model 限流、恢复工具、任务契约、
+独立验收、带摘要的补丁整合和清理预览。完整参数见[英文文档](README.md)与
+[更新记录](CHANGELOG.md)。默认仍是现有 Go provider 和六路全局上限，不自动切换付费模型。
+
+推荐流程：`job_submit(contract=...)` → 集中 `job_wait` → `job_verify` → 审查
+`job_diff` 与验收结果 → `job_apply(patch_sha256=已审查摘要)`。契约包含允许/禁止路径、
+验收命令和文件数量上限；有契约的任务要求验收通过且工件摘要仍一致。无检查不会算通过。
+原有无契约任务保留兼容模式，也可显式配置 `require_verification=true` 强制独立验收。
+摘要覆盖未忽略的工作区文件，不代表外部服务、依赖与忽略配置已被冻结。
+
+`job_recover` 可检查、请求中止或重新挂接已有会话；不会重放 prompt。
+`job_cleanup` 默认只预览，保护未整合或已变化的成果，不自动删除原生会话或历史任务。
+回问需全局与每任务同时选择开启，属实验功能；等待期间继续占用配额，不承诺自动释放槽位。
+task 工具仍禁用，执行者不再创建执行者。当前不自动派发修复任务。
+
+`scripts/measure_usage.py` 可记录选定 Codex 轮次与两个 worker 的实际计量，去重逐次响应，
+不导出 prompt、工具参数或本地会话标识。原始日志和生成报告仍须保存在仓库外或忽略路径。
+可用后台等待完成选项在本轮结束后补齐最终答复用量；尚未记录的用量会标注为快照。
 
 在新 Codex 聊天指定已允许的绝对项目路径，要求先检查 `bridge_health`、
 `bridge_models` 和 `project_prepare`，建立可运行的最小脚手架及干净的 Git 基线。

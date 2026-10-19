@@ -24,7 +24,7 @@ rate limits still apply. This is not an official OpenAI or OpenCode product.
 - PowerShell and `wsl.exe` for the Windows convenience scripts.
 - OpenCode provider authentication and access to the configured model.
 
-Bridge version: **1.1.0**. Validated with Ubuntu 24.04, OpenCode **1.19.2**, and
+Bridge version: **1.2.0**. Compatibility baseline: Ubuntu 24.04, OpenCode **1.19.2**, and
 Windows Codex CLI **0.163.0-alpha.10.2**. No compatibility with future versions is
 implied. The example worker model is **`opencode-go/deepseek-v4.1-flash`**;
 the provider controls that identifier's revision. Use `bridge_models` to check
@@ -72,6 +72,92 @@ environment variable changes its location; use an absolute private Linux path.
 belong in `config.json` or in this repository.
 
 ## Use from Codex
+
+For the new contracts, recovery, model routing and usage workflow, see the
+[1.2.0 changes](CHANGELOG.md). The conservative default remains the existing Go
+provider and six global slots. Model discovery never infers billing entitlement.
+Set `allowed_providers`/optional `allowed_models`, `provider_caps`, `model_caps`
+and `worker_profiles` in your ignored local config. Providers sharing an account
+should use a shared provider cap; model caps apply in addition. Profile selection
+is explicit and each job fixes its resolved model. No paid fallback is automatic.
+
+`bridge_models(refresh=true)` bypasses the 60-second catalog cache. A failed refresh
+may return a previous snapshot with `stale=true`; it cannot discover new entitlement.
+`job_status` includes a queue reason, progress phase and suggested next tool.
+`job_wait(after_event_id=...)` can return on semantic changes; keep batch waiting
+centralized in the coordinator rather than polling from every specialist.
+
+### Bounded work and acceptance
+
+`job_submit` accepts `profile` and an optional worktree `contract`, for example:
+
+```json
+{
+  "allowed_paths": ["src/**", "tests/**"],
+  "forbidden_paths": ["tests/acceptance/**"],
+  "checks": [["python3", "-m", "unittest", "discover", "-s", "tests"]],
+  "max_changed_files": 10,
+  "max_attempts": 2
+}
+```
+
+After execution, call `job_verify(job_id)` to run the submitted checks independently.
+No checks means `not_run`, never passed. Inspect both verification and the patch,
+then pass the reviewed `patch_sha256` to `job_apply`. Contract jobs require a
+successful verification matching the current patch and non-ignored workspace input
+hashes; changes require a new review/verification. `max_attempts` is a bounded
+execution policy field; this release dispatches one attempt and does not automatically
+create repair attempts. It does not limit how often independent checks may be rerun.
+Ignored files, external services, dependencies and host environment are not made
+immutable by the content digest; tests still need a controlled environment.
+
+The project application lock serializes bridge applies; unrelated host processes
+can still edit files. Existing non-conflicting batch patches may remain uncommitted
+while other patches from the same base are applied. Commit the reviewed batch before
+submitting the next worktree wave.
+
+`job_recover(action="inspect")` is read-only. `abort` reconciles cancellation;
+`reattach` schedules monitoring of an already admitted session without replaying its
+prompt. Unknown admission/termination needs inspection and continues consuming a
+slot. Native abort confirmation does not prove all OS descendant processes stopped.
+
+### Clarification questions and retention
+
+Native questions are experimental and disabled by default. Explicitly set
+`enable_questions=true` and submit `questions=true` for an opted-in job. Use
+`job_questions`, then `job_answer` with the exact question ID, an immutable
+idempotency `answer_id`, and native `answers` (array of arrays of strings).
+`answer_id` is not an option ID. Question replies are task guidance, not permission
+approval. On uncertain delivery, inspect/reconcile; never change the answer ID to
+force a resend. Disappearance alone only establishes `resolved_unknown`.
+This channel requires version-specific end-to-end validation for your OpenCode build.
+Waiting retains a worker thread, project protection and quota slot in this release;
+no unsupported slot-release or unlimited-wait claim is made. Original deadlines apply.
+
+`job_cleanup` defaults to a dry run and only targets one owned, terminal Git worktree.
+Unapplied or changed work requires explicit discard; applied dirty work must match
+verified archived content before force removal. Database/idempotency records are
+retained. Native OpenCode sessions and ignored outputs need separate retention
+policies. No global pruning or automatic TTL deletion is performed.
+
+### Recording the coordinator and workers
+
+`scripts/measure_usage.py` accepts an explicitly selected local Codex JSONL and
+saved worker `job_result` JSON files. It exports counters, not prompts or local IDs:
+
+```sh
+python3 scripts/measure_usage.py --codex-log <local-session-jsonl> --turn-id <selected-turn> \
+  --worker executor-a=<result-a.json> --worker executor-b=<result-b.json> \
+  --output <private-report.json>
+```
+
+When available, Codex `token_usage_record` responses are deduplicated by response ID;
+`token_count` events are not added again. Cached input/reasoning are subsets in Codex
+usage, not extra totals. Worker assistant-message counts are not exact upstream
+request counts, and cost metadata is not a subscription bill. Missing telemetry is
+reported as missing. Use `--wait-complete-seconds 600` for a local background exporter
+to include the final response after a selected turn finishes; otherwise it is a
+point-in-time snapshot. Raw session files and generated reports must remain private.
 
 Replace the project placeholder with an absolute Linux project path under an
 allowed root. A Windows drive path also works when its WSL location is allowed.

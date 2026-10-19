@@ -22,7 +22,8 @@ class Client:
         self.counter = 0
         self.lock = threading.Lock()
         self.pending = {}
-        threading.Thread(target=self.read, daemon=True).start()
+        self.reader = threading.Thread(target=self.read, daemon=True)
+        self.reader.start()
         self.rpc('initialize', {'protocolVersion': '2024-11-05', 'capabilities': {},
                                 'clientInfo': {'name': 'bridge-live-verifier', 'version': '1'}})
         self.process.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
@@ -59,6 +60,9 @@ class Client:
     def close(self):
         self.process.stdin.close()
         self.process.wait(timeout=10)
+        self.reader.join(timeout=2)
+        self.process.stdout.close()
+        self.process.stderr.close()
 
 
 def main():

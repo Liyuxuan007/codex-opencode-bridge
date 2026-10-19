@@ -26,6 +26,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from control_plane import ModelCatalog, cancel_job, recover_job, QuestionChannel, quota_block_reason
+from artifacts import ArtifactManager, normalize_contract
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / 'config.json'
@@ -33,9 +35,36 @@ if not CONFIG_PATH.is_file():
     CONFIG_PATH = ROOT / 'config.example.json'
 CONFIG = json.loads(CONFIG_PATH.read_text(encoding='utf-8-sig'))
 CONFIG['opencode_bin'] = os.path.expanduser(CONFIG['opencode_bin'])
-STATE = Path(os.environ.get('CODEX_OPENCODE_STATE', str(Path.home() / '.local/state/codex-opencode-bridge')))
-VERSION = '1.1.0'
+STATE = Path(os.environ.get('CODEX_OPENCODE_STATE', str(Path.home() / '.local/state/codex-opencode-bridge'))).expanduser()
+if not STATE.is_absolute():
+    raise ValueError('CODEX_OPENCODE_STATE must be an absolute private Linux path.')
+
+def validate_config(config):
+    if isinstance(config.get('max_concurrency'), bool) or not isinstance(config.get('max_concurrency'), int) or config['max_concurrency'] < 1:
+        raise ValueError('max_concurrency must be a positive integer.')
+    for key in ('provider_caps', 'model_caps'):
+        limits = config.get(key, {})
+        if not isinstance(limits, dict) or any(not isinstance(k, str) or not k or isinstance(v, bool) or not isinstance(v, int) or v < 1 for k, v in limits.items()):
+            raise ValueError(key + ' must map explicit IDs to positive integer limits.')
+    for key in ('allowed_providers', 'allowed_models'):
+        values = config.get(key)
+        if values is not None and (not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values)):
+            raise ValueError(key + ' must be an array of nonempty IDs.')
+    for key in ('enable_questions', 'require_verification'):
+        if key in config and not isinstance(config[key], bool):
+            raise ValueError(key + ' must be boolean.')
+    profiles = config.get('worker_profiles', {})
+    if not isinstance(profiles, dict) or any(not isinstance(v, dict) or not isinstance(v.get('model'), str) or '/' not in v['model'] or v.get('isolation', 'worktree') not in ('worktree', 'readonly', 'exclusive') for v in profiles.values()):
+        raise ValueError('worker_profiles must contain explicit model/isolation objects.')
+
+validate_config(CONFIG)
+VERSION = '1.2.0'
 TERMINAL = {'succeeded', 'failed', 'cancelled', 'timed_out'}
+JOB_LOCKS = [threading.RLock() for _ in range(64)]
+
+def job_lock(job_id):
+    return JOB_LOCKS[int(hashlib.sha256(job_id.encode()).hexdigest()[:8], 16) % len(JOB_LOCKS)]
+
 ACTIVE = {'starting', 'admitting', 'running', 'cancelling', 'attention_required'}
 INSTRUCTIONS = '''Delegate bounded implementation, investigation, or test work to OpenCode in WSL.
 Call bridge_health then project_prepare with the intended project path. Prefer Linux projects under
@@ -44,6 +73,8 @@ The shared broker caps ALL clients at the configured max_concurrency; do not sta
 subagents. Parallel writing tasks use worktree isolation. readonly is a tool policy, not an OS sandbox.
 Sessions are never shared between tasks. A succeeded job means the agent finished, NOT that its code
 is correct. Inspect job_result and job_diff, run relevant verification, then job_apply only after review.
+Prefer worktree task contracts with allowed paths and coordinator-supplied checks. Call job_verify,
+then apply the reviewed patch_sha256. Use job_recover for uncertain execution; never replay a prompt.
 Use job_wait in batches of up to eight IDs (at most 30 seconds), not frequent status polling.
 For multi-Codex orchestration, let specialists submit jobs and return their IDs; the primary agent
 centrally batch-waits and resumes specialists only for review, instead of every specialist polling.
@@ -169,6 +200,7 @@ class Store:
                 connection.execute('ALTER TABLE jobs ADD COLUMN started REAL')
             if 'progress' not in columns:
                 connection.execute('ALTER TABLE jobs ADD COLUMN progress TEXT')
+            connection.execute('CREATE TABLE IF NOT EXISTS job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, kind TEXT NOT NULL, created REAL NOT NULL)')
 
     @contextlib.contextmanager
     def connect(self):
@@ -194,8 +226,19 @@ class Store:
         if touch:
             values['updated'] = time.time()
         with self.connect() as connection:
+            previous = connection.execute('SELECT status FROM jobs WHERE id=?', (job_id,)).fetchone()
             connection.execute('UPDATE jobs SET ' + ','.join(k + '=?' for k in values) + ' WHERE id=?',
                                [*values.values(), job_id])
+            if 'status' in values and previous and previous['status'] != values['status']:
+                connection.execute('INSERT INTO job_events(job_id,kind,created) VALUES(?,?,?)', (job_id, values['status'], time.time()))
+
+    def record_event(self, job_id, kind):
+        with self.connect() as connection:
+            connection.execute('INSERT INTO job_events(job_id,kind,created) VALUES(?,?,?)', (job_id, kind, time.time()))
+
+    def event_cursor(self, ids):
+        with self.connect() as connection:
+            return connection.execute('SELECT COALESCE(MAX(id),0) FROM job_events WHERE job_id IN (' + ','.join('?' for _ in ids) + ')', ids).fetchone()[0]
 
     def existing_request(self, spec):
         signature = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
@@ -230,6 +273,10 @@ class Store:
             waiting_exclusive = set()
             for row in connection.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created").fetchall():
                 spec = json.loads(row['spec'])
+                if quota_block_reason(spec, [json.loads(a['spec']) for a in active], CONFIG):
+                    if spec['isolation'] == 'exclusive':
+                        waiting_exclusive.add(spec['project'])
+                    continue
                 if spec['project'] in waiting_exclusive:
                     continue
                 # Exclusive jobs serialize every job touching that source; worktree jobs are independent.
@@ -255,7 +302,11 @@ class Broker:
         init_state()
         self.store = Store(STATE / 'jobs.sqlite3')
         self.changed = threading.Condition()
+        self.session_conditions = {}
+        self.session_conditions_lock = threading.Lock()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(CONFIG['max_concurrency']))
+        self.running_jobs = set()
+        self.running_jobs_lock = threading.Lock()
         self.health = ensure_opencode()
         self.models = None
         threading.Thread(target=self.watch_events, daemon=True).start()
@@ -273,7 +324,14 @@ class Broker:
                             payload = json.loads(line[5:].strip())
                             event = payload.get('payload', payload)
                             if event.get('type') in ('session.idle', 'session.error', 'session.status', 'message.updated'):
-                                self.notify()
+                                properties = event.get('properties', {})
+                                sid = properties.get('sessionID') or properties.get('info', {}).get('sessionID')
+                                if sid:
+                                    with self.session_conditions_lock:
+                                        condition = self.session_conditions.get(sid)
+                                    if condition:
+                                        with condition:
+                                            condition.notify_all()
             except Exception:
                 time.sleep(2)
 
@@ -290,31 +348,60 @@ class Broker:
                 progress['warning'] = 'No observable progress. May be tool execution, reasoning, or provider wait; inspect before cancelling.'
         timing = {'queue_seconds': round(row['started']-row['created'], 3) if row['started'] else None,
                   'execution_seconds': round(((row['updated'] if row['status'] in TERMINAL else time.time())-row['started']), 3) if row['started'] else None}
-        return {key: row[key] for key in ('id', 'status', 'created', 'updated', 'session_id', 'workspace', 'base_commit', 'error')} | {
+        result = {key: row[key] for key in ('id', 'status', 'created', 'updated', 'session_id', 'workspace', 'base_commit', 'error')} | {
             'owner': spec['owner'], 'project': spec['project'], 'model': spec['model'],
             'isolation': spec['isolation'], 'request_id': spec['request_id'], 'timing': timing, 'progress': progress}
+        result['next_action'] = ('job_recover' if row['status'] in {'attention_required', 'cancelling'} else
+                                 'job_verify' if row['status'] == 'succeeded' and spec.get('contract') else
+                                 'job_result' if row['status'] in TERMINAL else 'job_wait')
+        if progress and progress.get('pending_questions'):
+            result['next_action'] = 'job_answer'
+        result['error_code'] = {'timed_out': 'execution_deadline', 'failed': 'execution_failed', 'attention_required': 'execution_uncertain'}.get(row['status'])
+        result['retryable'] = False  # Repeated admission uses the original request_id; execution replay is explicit.
+        if row['status'] == 'queued':
+            with self.store.connect() as connection:
+                active = [json.loads(r['spec']) for r in connection.execute("SELECT spec FROM jobs WHERE status IN ('starting','admitting','running','cancelling','attention_required')")]
+            reason = quota_block_reason(spec, active, CONFIG)
+            if len(active) >= CONFIG['max_concurrency']:
+                reason = 'global_limit'
+            elif any(a['project'] == spec['project'] and (a['isolation'] == 'exclusive' or spec['isolation'] == 'exclusive') for a in active):
+                reason = 'exclusive_lock'
+            result['queued_reason'] = reason or 'scheduler_pending'
+        return result
+
+    def session_condition(self, sid):
+        if not hasattr(self, 'session_conditions'):
+            return self.changed
+        with self.session_conditions_lock:
+            return self.session_conditions.setdefault(sid, threading.Condition())
 
     def notify(self):
         with self.changed:
             self.changed.notify_all()
 
+    def question_channel(self):
+        if not hasattr(self, '_questions'):
+            self._questions = QuestionChannel(self.store, oc, self.notify)
+        return self._questions
+
     def catalog(self):
-        if self.models is None:
-            result = subprocess.run([CONFIG['opencode_bin'], 'models', 'opencode-go'], capture_output=True, text=True, timeout=30)
-            if result.returncode:
-                raise RuntimeError('Cannot discover OpenCode Go models.')
-            self.models = sorted({line.strip() for line in result.stdout.splitlines() if line.startswith('opencode-go/')})
-        return self.models
+        if not hasattr(self, 'model_catalog'):
+            self.model_catalog = ModelCatalog(oc, CONFIG)
+        return self.model_catalog.list()['models']
 
     def submit(self, args):
         project = project_path(args['project'])
         task = args.get('task', '')
         if not isinstance(task, str) or not 1 <= len(task) <= 50000:
             raise ValueError('task must contain 1–50000 characters.')
-        model = args.get('model') or CONFIG['default_model']
+        profile = args.get('profile')
+        profiles = CONFIG.get('worker_profiles', {})
+        if profile is not None and profile not in profiles:
+            raise ValueError('Unknown worker profile; configure worker_profiles explicitly.')
+        model = args.get('model') or (profiles[profile]['model'] if profile else CONFIG['default_model'])
         if model not in self.catalog():
-            raise ValueError('Unknown Go model; call bridge_models.')
-        isolation = args.get('isolation', 'worktree')
+            raise ValueError('Unknown or disallowed model; call bridge_models.')
+        isolation = args.get('isolation', profiles[profile].get('isolation', 'worktree') if profile else 'worktree')
         if isolation not in ('worktree', 'readonly', 'exclusive'):
             raise ValueError('Unsupported isolation mode.')
         timeout = args.get('timeout_seconds', CONFIG['default_timeout_seconds'])
@@ -325,6 +412,16 @@ class Broker:
             raise ValueError('Invalid request_id.')
         spec = {'project': project, 'task': task, 'model': model, 'owner': args.get('owner', 'main'),
                 'isolation': isolation, 'timeout_seconds': timeout, 'request_id': request_id}
+        if profile is not None:
+            spec['profile'] = profile
+        if args.get('contract') is not None:
+            if isolation != 'worktree':
+                raise ValueError('Task contracts require worktree isolation.')
+            spec['contract'] = normalize_contract(args['contract'])
+        if args.get('questions'):
+            if not CONFIG.get('enable_questions', False):
+                raise ValueError('Question channel is disabled; enable_questions must be configured explicitly.')
+            spec['questions'] = True
         # Lookup before mutable repository preflight: a retry must still find its task after integration.
         existing = self.store.existing_request(spec)
         if existing:
@@ -374,7 +471,11 @@ class Broker:
         fingerprint = hashlib.sha256(encode(parts)).hexdigest()
         if previous and previous.get('fingerprint') == fingerprint:
             return
-        progress = {'last_progress_at': now, 'running_tools': running, 'fingerprint': fingerprint,
+        reasoning_chars = sum(len(p.get('text', '')) for m in messages for p in m.get('parts', []) if p.get('type') == 'reasoning')
+        visible_chars = sum(len(p.get('text', '')) for m in messages for p in m.get('parts', []) if p.get('type') == 'text')
+        phase = 'tool_running' if running else ('reasoning' if reasoning_chars else ('receiving_output' if visible_chars else 'provider_wait'))
+        progress = {'last_progress_at': now, 'running_tools': running, 'fingerprint': fingerprint, 'phase': phase,
+                    'reasoning_chars': reasoning_chars, 'visible_chars': visible_chars,
                     'recent_message_count': len(messages)}
         self.store.update(job_id, progress=json.dumps(progress), touch=False)
 
@@ -433,46 +534,72 @@ class Broker:
             row = self.store.get(job_id)
             spec = json.loads(row['spec'])
             if row['cancel_requested']:
-                self.store.update(job_id, status='cancelled')
+                if row['session_id'] and row['workspace']:
+                    cancel_job(self.store, oc, self.notify, job_id)
+                else:
+                    self.store.update(job_id, status='cancelled')
                 return
             workspace = self.prepare_workspace(row, spec)
             sid = row['session_id']
-            if not sid:
-                # Each job owns a new session: no idle-session claim races or cross-task context mixing.
-                permissions = [{'permission': '*', 'pattern': '*', 'action': 'allow'},
-                               {'permission': 'task', 'pattern': '*', 'action': 'deny'},
-                               {'permission': 'question', 'pattern': '*', 'action': 'deny'},
-                               {'permission': 'external_directory', 'pattern': '*', 'action': 'deny'}]
-                if spec['isolation'] == 'readonly':
-                    permissions += [{'permission': key, 'pattern': '*', 'action': 'deny'}
-                                    for key in ('edit', 'bash', 'apply_patch')]
-                provider, model = spec['model'].split('/', 1)
-                session = oc('/session', 'POST', {'title': f"Bridge {job_id} ({spec['owner']})", 'permission': permissions,
-                                                 'agent': 'build', 'model': {'providerID': provider, 'id': model}}, workspace)
-                sid = session['id']
-                self.store.update(job_id, session_id=sid)
-                self.store.update(job_id, status='admitting')
-                task = (f"Work only in {workspace}. Complete this bounded task: do not delegate to subagents, "
-                        "do not git commit/push, do not deploy or send messages. Run relevant checks when allowed. "
-                        "Finish with a concise summary, changed files, actual check results, and unresolved issues.\n\n" + spec['task'])
-                oc(f'/session/{sid}/prompt_async', 'POST', {
-                    'model': {'providerID': provider, 'modelID': model}, 'agent': 'build',
-                    'tools': {'task': False, 'question': False}, 'parts': [{'type': 'text', 'text': task}]}, workspace)
-                self.store.update(job_id, status='running')
-            elif recovering and row['status'] in ('starting', 'admitting'):
-                # A crash in the admit window is ambiguous; never replay a possibly executed instruction.
-                raise RuntimeError('Broker restarted during admission; inspect the retained OpenCode session before resubmitting.')
+            with job_lock(job_id):
+                if not sid:
+                    row = self.store.get(job_id)
+                    if row['cancel_requested']:
+                        self.store.update(job_id, status='cancelled')
+                        return
+                    # Each job owns a new session: no idle-session claim races or cross-task context mixing.
+                    permissions = [{'permission': '*', 'pattern': '*', 'action': 'allow'},
+                                   {'permission': 'task', 'pattern': '*', 'action': 'deny'},
+                                   {'permission': 'question', 'pattern': '*', 'action': 'allow' if spec.get('questions') else 'deny'},
+                                   {'permission': 'external_directory', 'pattern': '*', 'action': 'deny'}]
+                    if spec['isolation'] == 'readonly':
+                        permissions += [{'permission': key, 'pattern': '*', 'action': 'deny'}
+                                        for key in ('edit', 'bash', 'apply_patch')]
+                    provider, model = spec['model'].split('/', 1)
+                    session = oc('/session', 'POST', {'title': f"Bridge {job_id} ({spec['owner']})", 'permission': permissions,
+                                                     'agent': 'build', 'model': {'providerID': provider, 'id': model}}, workspace)
+                    sid = session['id']
+                    self.store.update(job_id, session_id=sid)
+                    self.store.update(job_id, status='admitting')
+                    task = (f"Work only in {workspace}. Complete this bounded task: do not delegate to subagents, "
+                            "do not git commit/push, do not deploy or send messages. Run relevant checks when allowed. "
+                            "Finish with a concise summary, changed files, actual check results, and unresolved issues.\n\n" + spec['task'])
+                    if spec.get('contract'):
+                        task += '\n\nAcceptance contract (scope rules are enforced on the resulting patch):\n' + json.dumps(spec['contract'])
+                    oc(f'/session/{sid}/prompt_async', 'POST', {
+                        'model': {'providerID': provider, 'modelID': model}, 'agent': 'build',
+                        'tools': {'task': False, 'question': bool(spec.get('questions'))}, 'parts': [{'type': 'text', 'text': task}]}, workspace)
+                    self.store.update(job_id, status='running')
+                elif recovering and row['status'] in ('starting', 'admitting'):
+                    # A crash in the admit window is ambiguous; never replay a possibly executed instruction.
+                    raise RuntimeError('Broker restarted during admission; inspect the retained OpenCode session before resubmitting.')
             deadline = (row['started'] or row['updated']) + spec['timeout_seconds']
             while True:
                 current = self.store.get(job_id)
                 if current['cancel_requested'] or time.time() >= deadline:
-                    oc(f'/session/{sid}/abort', 'POST', {}, workspace)
-                    self.store.update(job_id, status='cancelled' if current['cancel_requested'] else 'timed_out',
-                                      error=None if current['cancel_requested'] else f"Execution deadline exceeded ({spec['timeout_seconds']}s).")
+                    cancel_job(self.store, oc, self.notify, job_id)
+                    confirmed = self.store.get(job_id)
+                    if not current['cancel_requested'] and confirmed['status'] == 'cancelled':
+                        self.store.update(job_id, status='timed_out', error=f"Execution deadline exceeded ({spec['timeout_seconds']}s).")
                     self.retain_partial(job_id)
                     return
                 messages = oc(f'/session/{sid}/message?limit=2', directory=workspace)
                 self.update_progress(job_id, messages)
+                if spec.get('questions'):
+                    pending = self.question_channel().discover(job_id)
+                    progress = json.loads(self.store.get(job_id)['progress'] or '{}')
+                    old_ids = [q['id'] for q in json.loads(current['progress'] or '{}').get('pending_questions', [])]
+                    progress['pending_questions'] = pending['questions']
+                    if pending.get('capability_uncertain'):
+                        progress['question_warning'] = pending.get('error')
+                    if pending['questions']:
+                        progress['phase'] = 'waiting_parent'
+                    elif progress.get('phase') == 'waiting_parent':
+                        progress['phase'] = 'provider_wait'
+                    self.store.update(job_id, progress=json.dumps(progress), touch=False)
+                    if old_ids != [q['id'] for q in pending['questions']]:
+                        self.store.record_event(job_id, 'questions_changed')
+                        self.notify()
                 assistants = [m for m in messages if m.get('info', {}).get('role') == 'assistant']
                 if assistants:
                     last = assistants[-1]
@@ -486,77 +613,88 @@ class Broker:
                 status = statuses.get(sid, {}).get('type') if isinstance(statuses, dict) else None
                 if status == 'idle' and time.time() - (row['started'] or row['updated']) > 15:
                     raise RuntimeError('OpenCode became idle without a completed final answer; inspect its session.')
-                with self.changed:
-                    self.changed.wait(2)
+                condition = self.session_condition(sid)
+                with condition:
+                    condition.wait(2)
             if last['info'].get('error'):
                 raise RuntimeError(json.dumps(last['info']['error'], ensure_ascii=False)[:1800])
             text = '\n'.join(p.get('text', '') for p in last.get('parts', []) if p.get('type') == 'text').strip()
             if not text or not last['info'].get('time', {}).get('completed'):
                 raise RuntimeError('No completed final text was returned. The task is not marked successful.')
             result = self.snapshot_result(self.store.get(job_id))
+            if spec.get('contract'):
+                result['artifact'] = self.artifacts().freeze(self.store.get(job_id) | {'status': 'succeeded'}, spec['contract'])
             # Cancellation and completion compete under one transaction; cancellation wins if admitted first.
             with self.store.connect() as connection:
                 connection.execute('BEGIN IMMEDIATE')
                 cancelled = connection.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()[0]
                 connection.execute('UPDATE jobs SET status=?,result=?,updated=? WHERE id=?',
                                    ('cancelled' if cancelled else 'succeeded', json.dumps(result, ensure_ascii=False), time.time(), job_id))
+                connection.execute('INSERT INTO job_events(job_id,kind,created) VALUES(?,?,?)',
+                                   (job_id, 'completed', time.time()))
         except Exception as error:
             current = self.store.get(job_id)
-            abort_error = None
+            requested = bool(current['cancel_requested'])
+            status = 'cancelled' if requested else 'failed'
             if sid and workspace:
                 try:
-                    oc(f'/session/{sid}/abort', 'POST', {}, workspace)
-                except Exception as failure:
-                    abort_error = str(failure)
-            status = 'attention_required' if abort_error else ('cancelled' if current['cancel_requested'] else 'failed')
-            detail = str(error) + (f'; abort was not confirmed: {abort_error}' if abort_error else '')
-            self.store.update(job_id, status=status, error=detail[:2500])
+                    cancel_job(self.store, oc, self.notify, job_id)
+                    reconciled = self.store.get(job_id)
+                    if reconciled['status'] == 'succeeded':
+                        return
+                    if reconciled['status'] != 'cancelled':
+                        status = 'attention_required'
+                except Exception:
+                    status = 'attention_required'
+            self.store.update(job_id, status=status, error=str(error)[:2500])
             self.retain_partial(job_id)
         finally:
+            if hasattr(self, 'session_conditions') and sid:
+                with self.session_conditions_lock:
+                    self.session_conditions.pop(sid, None)
             self.notify()
+
+    def execute_job(self, job_id, recovering=False):
+        with self.running_jobs_lock:
+            if job_id in self.running_jobs or self.store.get(job_id)['status'] in TERMINAL:
+                return
+            self.running_jobs.add(job_id)
+        try:
+            self.run(job_id, recovering)
+        finally:
+            with self.running_jobs_lock:
+                self.running_jobs.discard(job_id)
 
     def schedule(self):
         # Reattach to already-admitted sessions; do not repeat model prompts after restart.
-        for row in reversed(self.store.rows(10000)):
-            if row['status'] in ACTIVE and row['status'] != 'attention_required':
-                self.executor.submit(self.run, row['id'], True)
+        with self.store.connect() as connection:
+            recovering = [dict(r) for r in connection.execute("SELECT * FROM jobs WHERE status IN ('starting','admitting','running','cancelling') ORDER BY created")]
+        for row in recovering:
+            self.executor.submit(self.execute_job, row['id'], True)
         while True:
             job_id = self.store.claim(int(CONFIG['max_concurrency']))
             if job_id:
-                self.executor.submit(self.run, job_id)
+                self.executor.submit(self.execute_job, job_id)
             else:
                 with self.changed:
                     self.changed.wait(1)
 
     def cancel(self, job_id):
-        with self.store.connect() as connection:
-            connection.execute('BEGIN IMMEDIATE')
-            row = connection.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
-            if not row:
-                raise ValueError('Unknown job ID.')
-            if row['status'] not in TERMINAL:
-                connection.execute('UPDATE jobs SET cancel_requested=1,status=?,updated=? WHERE id=?',
-                                   ('cancelled' if row['status'] == 'queued' else 'cancelling', time.time(), job_id))
-        if row['session_id'] and row['status'] not in TERMINAL:
-            oc(f"/session/{row['session_id']}/abort", 'POST', {}, row['workspace'])
-            if row['status'] == 'attention_required':
-                self.store.update(job_id, status='cancelled')
-        self.notify()
+        before = self.store.get(job_id)['status']
+        with job_lock(job_id):
+            cancel_job(self.store, oc, self.notify, job_id)
+        if self.store.get(job_id)['status'] != before:
+            self.store.record_event(job_id, 'cancel_reconciled')
         return self.brief(self.store.get(job_id))
+
+    def artifacts(self):
+        return ArtifactManager(STATE, git)
 
     def diff(self, job_id):
         row = self.store.get(job_id)
-        if row['status'] not in TERMINAL or not row['workspace']:
-            raise ValueError('Wait for the job to finish before inspecting the complete diff.')
-        if json.loads(row['spec'])['isolation'] != 'worktree':
-            raise ValueError('Patch integration is available only for isolated worktree jobs.')
-        workspace = row['workspace']
-        git(workspace, 'add', '--intent-to-add', '--', '.')
-        patch = git(workspace, 'diff', '--binary', row['base_commit'], binary=True).stdout
-        path = STATE / 'patches' / (job_id + '.patch')
-        path.parent.mkdir(exist_ok=True)
-        path.write_bytes(patch)
-        return row, patch, str(path)
+        artifact = self.artifacts().freeze(row, json.loads(row['spec']).get('contract'))
+        path = artifact['patch_path']
+        return row, Path(path).read_bytes(), path
 
     def call(self, name, args):
         if name == 'bridge_health':
@@ -565,7 +703,8 @@ class Broker:
             return {'version': VERSION, 'opencode': oc('/global/health'), 'max_concurrency': CONFIG['max_concurrency'],
                     'default_model': CONFIG['default_model'], 'counts': counts, 'allowed_roots': CONFIG['allowed_roots']}
         if name == 'bridge_models':
-            return {'models': self.catalog(), 'default': CONFIG['default_model']}
+            self.catalog()
+            return self.model_catalog.list(refresh=bool(args.get('refresh', False)))
         if name == 'project_prepare':
             path = project_path(args['path'], create=args.get('create', False))
             git_root = git(path, 'rev-parse', '--show-toplevel', check=False)
@@ -610,12 +749,28 @@ class Broker:
             deadline = time.time() + min(30, max(0, float(args.get('seconds', 25))))
             while True:
                 rows = [self.store.get(job_id) for job_id in ids]
-                if any(row['status'] in TERMINAL | {'attention_required'} for row in rows) or time.time() >= deadline:
-                    return {'jobs': [self.brief(row) for row in rows]}
+                cursor = self.store.event_cursor(ids)
+                questions = any(json.loads(r['progress'] or '{}').get('pending_questions') for r in rows)
+                changed = args.get('after_event_id') is not None and cursor > args['after_event_id']
+                if any(row['status'] in TERMINAL | {'attention_required'} for row in rows) or questions or changed or time.time() >= deadline:
+                    return {'jobs': [self.brief(row) for row in rows], 'event_id': cursor, 'changed': bool(changed)}
                 with self.changed:
                     self.changed.wait(min(1, max(0, deadline - time.time())))
         if name == 'job_cancel':
             return self.cancel(args['job_id'])
+        if name in ('job_questions', 'job_answer'):
+            row = self.store.get(args['job_id'])
+            if not CONFIG.get('enable_questions', False) or not json.loads(row['spec']).get('questions'):
+                raise ValueError('This job did not opt into the question channel.')
+            if name == 'job_questions':
+                if args.get('action') == 'reconcile':
+                    return self.question_channel().reconcile(row['id'])
+                return self.question_channel().discover(row['id'])
+            with job_lock(row['id']):
+                result = self.question_channel().answer(row['id'], args['question_id'], args['answer_id'], args['answers'])
+            self.store.record_event(row['id'], 'answer_processed')
+            self.notify()
+            return result
         if name == 'run_check':
             if bool(args.get('project')) == bool(args.get('job_id')):
                 raise ValueError('Provide exactly one of project or job_id.')
@@ -644,23 +799,39 @@ class Broker:
             limit = min(100000, max(1000, int(args.get('max_chars', 20000))))
             text = patch.decode('utf-8', errors='replace')
             return {'job_id': row['id'], 'patch_path': path, 'patch': text[:limit], 'truncated': len(text) > limit}
+        if name == 'job_verify':
+            row = self.store.get(args['job_id'])
+            contract = json.loads(row['spec']).get('contract')
+            checks = args.get('checks')
+            if checks is None:
+                checks = (contract or {}).get('checks', [])
+            return self.artifacts().verify(row, checks, contract, timeout=min(900, max(1, int(args.get('timeout_seconds', 120)))))
+        if name == 'job_cleanup':
+            row = self.store.get(args['job_id'])
+            return self.artifacts().cleanup(row, json.loads(row['spec'])['project'],
+                                            dry_run=args.get('dry_run', True), discard=args.get('discard', False))
+        if name == 'job_recover':
+            action = args.get('action', 'inspect')
+            with job_lock(args['job_id']):
+                result = recover_job(self.store, oc, self.notify, args['job_id'], action)
+                if action == 'reattach' and result.get('eligible'):
+                    row = self.store.get(args['job_id'])
+                    if row['status'] in {'starting', 'admitting'}:
+                        return result | {'scheduled': False, 'reason': 'Admission is uncertain; inspect or abort.'}
+                    if row['status'] == 'attention_required' and not row['cancel_requested']:
+                        self.store.update(row['id'], status='running', error=None)
+                    self.executor.submit(self.execute_job, row['id'], True)
+                    result['scheduled'] = True
+                    self.notify()
+            return result
         if name == 'job_apply':
-            row, patch, path = self.diff(args['job_id'])
+            row = self.store.get(args['job_id'])
             if row['status'] != 'succeeded':
-                raise ValueError('Only successful jobs may be integrated through this tool.')
-            project = json.loads(row['spec'])['project']
-            if git(project, 'rev-parse', 'HEAD') != row['base_commit']:
-                raise ValueError('Source HEAD changed. Review/rebase the retained patch manually.')
-            if not patch:
-                return {'applied': False, 'reason': 'No changes.'}
-            forward = git(project, 'apply', '--check', '--binary', '-', data=patch, binary=True, check=False)
-            if forward.returncode:
-                reverse = git(project, 'apply', '--check', '--reverse', '--binary', '-', data=patch, binary=True, check=False)
-                if reverse.returncode == 0:
-                    return {'applied': True, 'already_applied': True, 'project': project, 'patch_path': path}
-                raise RuntimeError(forward.stderr.decode('utf-8', errors='replace')[:1500])
-            git(project, 'apply', '--binary', '-', data=patch)
-            return {'applied': True, 'project': project, 'patch_path': path, 'changes': git(project, 'status', '--short')}
+                raise ValueError('Only successful jobs may be integrated.')
+            spec = json.loads(row['spec'])
+            return self.artifacts().apply(row, spec['project'], spec.get('contract'),
+                                          require_verification=bool(spec.get('contract')) or CONFIG.get('require_verification', False),
+                                          expected_patch_sha256=args.get('patch_sha256'))
         raise ValueError('Unknown tool: ' + name)
 
 
@@ -673,25 +844,35 @@ I = {'type': 'integer'}
 B = {'type': 'boolean'}
 TOOLS = [
     ('bridge_health', 'Check WSL OpenCode readiness, shared queue, limits and project roots.', schema()),
-    ('bridge_models', 'List model IDs discoverable through the existing OpenCode Go provider.', schema()),
+    ('bridge_models', 'List explicitly allowed provider models; optional refresh bypasses the TTL cache. Visibility is not billing entitlement.', schema({'refresh': B})),
     ('project_prepare', 'Check a Linux/Windows project path; optionally create it and initialize an empty Git baseline.',
      schema({'path': S, 'create': B, 'initialize_git': B}, ['path'])),
     ('job_submit', 'Queue one independent OpenCode task. Use worktree for parallel writes; unique request_id makes retries idempotent.',
-     schema({'project': S, 'task': S, 'owner': S, 'model': S, 'request_id': S,
+     schema({'project': S, 'task': S, 'owner': S, 'model': S, 'profile': S, 'contract': {'type': 'object'}, 'questions': B, 'request_id': S,
              'isolation': {'type': 'string', 'enum': ['worktree', 'readonly', 'exclusive']}, 'timeout_seconds': I}, ['project', 'task', 'request_id'])),
     ('job_list', 'List recent tasks from all Codex callers sharing this broker.', schema({'limit': I})),
     ('job_status', 'Read one task status without retrieving its full output.', schema({'job_id': S}, ['job_id'])),
     ('job_result', 'Retrieve task output, cumulative session usage, and partial timeout diagnostics. Success still needs independent verification.',
      schema({'job_id': S, 'max_chars': I}, ['job_id'])),
     ('job_wait', 'Wait up to 30 seconds for any of 1–8 tasks to finish; omit already completed IDs on subsequent waits.',
-     schema({'job_ids': {'type': 'array', 'items': S, 'minItems': 1, 'maxItems': 8}, 'seconds': I}, ['job_ids'])),
+     schema({'job_ids': {'type': 'array', 'items': S, 'minItems': 1, 'maxItems': 8}, 'seconds': I, 'after_event_id': I}, ['job_ids'])),
     ('job_cancel', 'Cancel the specified queued/running job without cancelling its siblings.', schema({'job_id': S}, ['job_id'])),
+    ('job_recover', 'Inspect uncertain execution, request abort, or reattach without replaying a prompt.',
+     schema({'job_id': S, 'action': {'type': 'string', 'enum': ['inspect', 'abort', 'reattach']}}, ['job_id'])),
+    ('job_verify', 'Run coordinator-supplied checks, freeze patch/input hashes, and persist acceptance evidence.',
+     schema({'job_id': S, 'checks': {'type': 'array', 'items': {'type': 'array', 'items': S}}, 'timeout_seconds': I}, ['job_id'])),
+    ('job_cleanup', 'Preview or remove an owned finished worktree. Unintegrated artifacts need explicit discard.',
+     schema({'job_id': S, 'dry_run': B, 'discard': B}, ['job_id'])),
+    ('job_questions', 'Inspect pending native clarification questions, or reconcile an uncertain answer without resending.',
+     schema({'job_id': S, 'action': {'type': 'string', 'enum': ['inspect', 'reconcile']}}, ['job_id'])),
+    ('job_answer', 'Answer one pending clarification with an idempotency key; no permission escalation.',
+     schema({'job_id': S, 'question_id': S, 'answer_id': S, 'answers': {'type': 'array', 'items': {'type': 'array', 'items': S}}}, ['job_id', 'question_id', 'answer_id', 'answers'])),
     ('run_check', 'Run an explicit verification command in a project or finished writing-task workspace. No model call or implicit shell; returns actual exit code.',
      schema({'project': S, 'job_id': S, 'argv': {'type': 'array', 'items': S, 'minItems': 1}, 'timeout_seconds': I}, ['argv'])),
     ('job_diff', 'Inspect the complete patch artifact of a finished worktree task; output is bounded.',
      schema({'job_id': S, 'max_chars': I}, ['job_id'])),
     ('job_apply', 'Apply a reviewed successful worktree patch to its source directory after git apply --check. No commit or push.',
-     schema({'job_id': S}, ['job_id'])),
+     schema({'job_id': S, 'patch_sha256': S}, ['job_id'])),
 ]
 
 
@@ -794,8 +975,8 @@ def mcp():
                 read_only = {'bridge_models', 'job_list', 'job_status', 'job_result', 'job_wait'}
                 for tool in result['tools']:
                     tool['annotations'] = {'readOnlyHint': tool['name'] in read_only,
-                                           'destructiveHint': tool['name'] in ('job_cancel', 'job_apply'),
-                                           'idempotentHint': tool['name'] in read_only | {'job_cancel', 'job_apply'},
+                                           'destructiveHint': tool['name'] in ('job_cancel', 'job_apply', 'job_cleanup'),
+                                           'idempotentHint': tool['name'] in read_only | {'job_cancel', 'job_apply', 'job_answer'},
                                            'openWorldHint': tool['name'] == 'job_submit'}
             elif method == 'tools/call':
                 if not ready.is_set():
@@ -804,7 +985,18 @@ def mcp():
                             ensure_broker()
                             ready.set()
                 params = request['params']
-                response = broker_call(params['name'], params.get('arguments', {}))
+                arguments = params.get('arguments', {})
+                timeout = 40
+                if params['name'] in ('job_verify', 'run_check'):
+                    checks = arguments.get('checks')
+                    if params['name'] == 'job_verify' and checks is None:
+                        # The stored contract may contain multiple checks. Keep enough transport
+                        # headroom; operation deadlines remain enforced by the broker.
+                        count = 20
+                    else:
+                        count = max(1, len(checks or []))
+                    timeout = min(18020, count * min(900, max(1, int(arguments.get('timeout_seconds', 120))))) + 20
+                response = broker_call(params['name'], arguments, timeout=timeout)
                 data = response.get('data') if response['ok'] else {'error': response['error']}
                 result = {'content': [{'type': 'text', 'text': json.dumps(data, ensure_ascii=False)}],
                           'isError': not response['ok']}
