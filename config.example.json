@@ -1,0 +1,13 @@
+{
+  "distro": "Ubuntu-24.04",
+  "opencode_bin": "~/.local/bin/opencode",
+  "opencode_port": 48186,
+  "broker_port": 48187,
+  "max_concurrency": 6,
+  "stale_warning_seconds": 120,
+  "default_model": "opencode-go/deepseek-v4.1-flash",
+  "allowed_roots": [
+    "~/projects"
+  ],
+  "default_timeout_seconds": 1800
+}

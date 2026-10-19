@@ -1,0 +1,75 @@
+# Codex ↔ WSL OpenCode 桥接
+
+[English and complete tool reference](README.md) · [安全说明](SECURITY.md)
+
+使用 Python 标准库，将 Codex 的任务经 MCP 交给 WSL 中的常驻 OpenCode。
+多个 Codex 调用方共用 SQLite 队列和全局并发上限（默认 6），每个任务使用独立
+会话，并行写任务使用独立 Git worktree。桥接不复制或转换订阅凭证，也不绕过额度。
+本项目不是 OpenAI 或 OpenCode 的官方产品。
+
+## 安装
+
+要求 WSL2、Python 3.10+、Git、已登录的 OpenCode CLI，以及 Windows Codex CLI。
+已验证环境：Ubuntu 24.04、OpenCode 1.19.2、Codex CLI 0.163.0-alpha.10.2。
+桥接版本 1.1.0。默认模型示例为 `opencode-go/deepseek-v4.1-flash`，具体 revision
+由提供商管理；安装前确认账户可用模型。代码不包含模型权重、数据集或向量库。
+
+1. 克隆仓库到 WSL 可访问的位置。
+2. 复制 `config.example.json` 为 `config.json`，编辑 WSL 发行版、OpenCode
+   可执行路径、模型及项目根目录。默认仅允许 `~/projects`，`~` 在 Linux 中展开。
+   如需 Windows 项目，仅增加对应的、尽可能窄的 WSL 项目目录。
+3. 在 WSL 中完成 OpenCode 登录并检查模型访问权限。
+4. 在 Windows PowerShell 的仓库目录运行：
+
+```powershell
+.\Install.ps1
+.\Bridge.ps1 -Action doctor
+.\Bridge.ps1 -Action models
+.\Bridge.ps1 -Action test
+```
+
+安装器自动识别 WSL 用户目录，运行文件安装到 `~/.local/share/codex-opencode-bridge`，
+私有状态保存在 `~/.local/state/codex-opencode-bridge`。安装器会备份已有 Windows
+Codex 配置并注册 MCP；重新打开 Codex 聊天即可加载工具。升级前完成或取消所有任务，
+保留自己的本地配置并手动审阅模板新增字段。Linux Codex 的安装命令见英文文档。
+
+`config.json` 不入库；认证继续由各 CLI 管理。`.env.example` 仅说明可选的
+`CODEX_OPENCODE_STATE` 环境变量，程序不会自动读取 `.env`，不要在这里填 API key。
+
+## 使用与效率
+
+在新 Codex 聊天指定已允许的绝对项目路径，要求先检查 `bridge_health`、
+`bridge_models` 和 `project_prepare`，建立可运行的最小脚手架及干净的 Git 基线。
+按可独立验收的小任务调用 `job_submit`，使用稳定且唯一的 `request_id` 和明确的
+`owner`，并行写任务选 `worktree`。由主 agent 集中批量 `job_wait`，子 agent
+提交后返回 ID，结果到达再恢复审查，避免各层反复轮询。
+
+使用 `job_result` 检查答案和累计用量、`job_diff` 审查补丁、`run_check` 进行独立
+验证，确认后 `job_apply`。后者不会提交或推送。确定性的测试直接运行命令，不必
+额外调用模型。`succeeded` 仅表示模型完成答复，不代表代码已通过验收。
+
+`exclusive` 模式直接修改项目，与同一项目的任务互斥。`readonly` 禁止编辑和 shell
+工具，但它只是工具策略。worktree、允许目录均不是操作系统沙箱，OpenCode 不会
+自动继承 Codex 的权限边界。写任务及 `run_check` 以 WSL 用户权限执行。
+
+进度超过 120 秒没有可观察变化时提示停滞，不自动杀死或重放任务。超时保留部分结果，
+不确定的提交不盲目重试；中止状态不明时保留槽位并提示人工检查。发生崩溃时不能保证
+工具副作用恰好执行一次。累计 usage 不是订阅账单，也不包含所有 Codex 主控用量。
+
+## 验证和上传防护
+
+离线回归：`python3 -m unittest test_bridge -v`。发布策略测试：
+`python3 -m unittest discover -s scripts -p 'test_*.py' -v`。
+`verify_live.py` 会使用六个模型任务并保留本地测试项目及报告，应只在有额度、配置正确
+且共享服务空闲时主动运行，CI 不调用模型。`--resume` 可复核已有报告。
+
+采用默认拒绝的 `.gitignore`；新增公开文件必须同时审阅并更新发布扫描器的文件白名单。
+本地配置、Agent 状态、凭证、日志、prompt、数据库、补丁、验收报告、模型及数据均
+不上传。安装 Gitleaks 后运行 `python3 scripts/install_hooks.py`，或安装 pre-commit
+钩子；CI 再次检查。推送前仍须人工审阅暂存差异，并确认 GitHub 的 secret scanning
+和 push protection 已启用。扫描通过不等于能够发现所有敏感信息。
+
+忽略文件仍可能被 agent 读取。不要把生产密钥放进工作目录，不要在公开 issue 中粘贴
+原始日志、会话或补丁。更完整的权限和保留数据说明见 [SECURITY.md](SECURITY.md)。
+
+尚未选择开源许可证；公开可见不等于授予通用复用许可，仓库所有者可另行添加许可证。
