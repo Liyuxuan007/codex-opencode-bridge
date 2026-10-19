@@ -69,6 +69,7 @@ class EfficiencyIntegrationTests(unittest.TestCase):
         saved = json.loads(self.broker.store.get(job['id'])['spec'])
         self.assertEqual(saved['brief'], args['brief'])
         self.assertEqual(saved['risk'], 'high')
+        self.assertEqual(self.broker.call('job_status', {'job_id': job['id']})['risk'], 'high')
 
     def test_optional_fields_do_not_change_legacy_request_identity(self):
         legacy = spec(isolation='readonly')

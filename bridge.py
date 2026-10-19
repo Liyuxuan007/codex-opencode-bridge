@@ -363,7 +363,8 @@ class Broker:
                   'execution_seconds': round(((row['updated'] if row['status'] in TERMINAL else time.time())-row['started']), 3) if row['started'] else None}
         result = {key: row[key] for key in ('id', 'status', 'created', 'updated', 'session_id', 'workspace', 'base_commit', 'error')} | {
             'owner': spec['owner'], 'project': spec['project'], 'model': spec['model'],
-            'isolation': spec['isolation'], 'request_id': spec['request_id'], 'timing': timing, 'progress': progress}
+            'isolation': spec['isolation'], 'request_id': spec['request_id'], 'timing': timing, 'progress': progress,
+            'risk': spec.get('risk', 'standard')}
         result['next_action'] = ('job_recover' if row['status'] in {'attention_required', 'cancelling'} else
                                  'job_verify' if row['status'] == 'succeeded' and spec.get('contract') else
                                  'job_result' if row['status'] in TERMINAL else 'job_wait')
@@ -860,7 +861,7 @@ class Broker:
                     item[stream] = output[-retained:] if retained else ''
                     item[stream + '_truncated'] = bool(check.get(stream + '_truncated')) or len(output) > retained
                 summary['checks'].append(item)
-            return summary | {'view': 'compact', 'detail_hint': 'Use view=full for retained verification details.'}
+            return summary | {'view': 'compact', 'detail_hint': 'Use action=inspect, view=full to read retained evidence without rerunning checks.'}
         if name == 'job_cleanup':
             row = self.store.get(args['job_id'])
             return self.artifacts().cleanup(row, json.loads(row['spec'])['project'],

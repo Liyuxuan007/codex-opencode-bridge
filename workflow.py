@@ -20,7 +20,7 @@ MAX_BRIEF_ITEM_CHARS = 1000
 MAX_ERROR_CHARS = 1000
 MAX_GIT_STATUS_CHARS = 1000
 MAX_RUNNING_TOOLS = 4
-ESSENTIAL_KEYS = ('id', 'status', 'owner', 'model', 'isolation', 'timing',
+ESSENTIAL_KEYS = ('id', 'status', 'owner', 'model', 'isolation', 'risk', 'timing',
                   'next_action', 'error', 'error_code', 'retryable', 'queued_reason')
 _MISSING = object()
 
