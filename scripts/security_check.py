@@ -7,6 +7,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWED = {
+    'control_plane.py', 'artifacts.py', 'test_control_plane.py', 'test_artifacts.py',
+    'test_integration.py', 'CHANGELOG.md', 'scripts/measure_usage.py',
     '.gitignore', '.gitattributes', '.pre-commit-config.yaml', '.env.example',
     'README.md', 'README.zh-CN.md', 'SECURITY.md', 'CONTRIBUTING.md',
     'config.example.json', 'bridge.py', 'deploy.py', 'test_bridge.py',

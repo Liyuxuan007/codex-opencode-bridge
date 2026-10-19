@@ -10,6 +10,13 @@
 !.env.example
 !config.example.json
 !bridge.py
+!control_plane.py
+!artifacts.py
+!test_control_plane.py
+!test_artifacts.py
+!test_integration.py
+!CHANGELOG.md
+!scripts/measure_usage.py
 !deploy.py
 !test_bridge.py
 !verify_live.py
