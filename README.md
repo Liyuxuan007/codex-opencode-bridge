@@ -4,7 +4,7 @@
 
 A Python standard-library MCP server that delegates bounded coding tasks from
 Codex to a persistent OpenCode service in WSL. Multiple Codex callers share one
-durable SQLite queue, a configurable global concurrency limit (default six), and
+durable SQLite queue, a configurable global concurrency limit (default two), and
 independent OpenCode sessions. Parallel writing tasks use separate Git worktrees.
 
 ```text
@@ -24,7 +24,7 @@ rate limits still apply. This is not an official OpenAI or OpenCode product.
 - PowerShell and `wsl.exe` for the Windows convenience scripts.
 - OpenCode provider authentication and access to the configured model.
 
-Bridge version: **1.2.0**. Compatibility baseline: Ubuntu 24.04, OpenCode **1.19.2**, and
+Bridge version: **1.3.0**. Compatibility baseline: Ubuntu 24.04, OpenCode **1.19.2**, and
 Windows Codex CLI **0.163.0-alpha.10.2**. No compatibility with future versions is
 implied. The example worker model is **`opencode-go/deepseek-v4.1-flash`**;
 the provider controls that identifier's revision. Use `bridge_models` to check
@@ -74,8 +74,8 @@ belong in `config.json` or in this repository.
 ## Use from Codex
 
 For the new contracts, recovery, model routing and usage workflow, see the
-[1.2.0 changes](CHANGELOG.md). The conservative default remains the existing Go
-provider and six global slots. Model discovery never infers billing entitlement.
+[changes](CHANGELOG.md) and [coordinator workflow](WORKFLOW.md). The conservative default remains the existing Go
+provider and two global slots. The template also requires independent verification before apply. Model discovery never infers billing entitlement.
 Set `allowed_providers`/optional `allowed_models`, `provider_caps`, `model_caps`
 and `worker_profiles` in your ignored local config. Providers sharing an account
 should use a shared provider cap; model caps apply in addition. Profile selection
@@ -84,12 +84,18 @@ is explicit and each job fixes its resolved model. No paid fallback is automatic
 `bridge_models(refresh=true)` bypasses the 60-second catalog cache. A failed refresh
 may return a previous snapshot with `stale=true`; it cannot discover new entitlement.
 `job_status` includes a queue reason, progress phase and suggested next tool.
+Status/result/wait default to compact views; request `view="full"` for legacy metadata.
+`result_max_chars` (2500) and `check_output_chars` (2000) bound default output.
+Successful verification tails are at most 256 characters per stream. Retained evidence
+is unchanged; truncation flags identify omitted output. `result_view="full"` opts out.
 `job_wait(after_event_id=...)` can return on semantic changes; keep batch waiting
 centralized in the coordinator rather than polling from every specialist.
 
 ### Bounded work and acceptance
 
-`job_submit` accepts `profile` and an optional worktree `contract`, for example:
+`job_submit` accepts `profile`, optional structured `brief`, `risk` guidance, and a
+worktree `contract`. See WORKFLOW.md for task ownership, report format and repair
+limits. Risk guidance never relaxes verification. Example contract:
 
 ```json
 {
@@ -148,14 +154,16 @@ saved worker `job_result` JSON files. It exports counters, not prompts or local 
 ```sh
 python3 scripts/measure_usage.py --codex-log <local-session-jsonl> --turn-id <selected-turn> \
   --worker executor-a=<result-a.json> --worker executor-b=<result-b.json> \
-  --output <private-report.json>
+  --assessment <private-assessment.json> --output <private-report.json>
 ```
 
 When available, Codex `token_usage_record` responses are deduplicated by response ID;
 `token_count` events are not added again. Cached input/reasoning are subsets in Codex
 usage, not extra totals. Worker assistant-message counts are not exact upstream
 request counts, and cost metadata is not a subscription bill. Missing telemetry is
-reported as missing. Use `--wait-complete-seconds 600` for a local background exporter
+reported as missing. Optional `--assessment` contains restricted manual acceptance
+counters (see WORKFLOW.md); schema 2 adds an efficiency summary without inferring
+quality from execution success or summing overlapping runtimes. Use `--wait-complete-seconds 600` for a local background exporter
 to include the final response after a selected turn finishes; otherwise it is a
 point-in-time snapshot. Raw session files and generated reports must remain private.
 
@@ -219,8 +227,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py' -v
 Stopping/redeploying refuses active or queued jobs. Removing MCP registration with
 `codex mcp remove opencode_bridge` leaves projects and private state intact.
 `verify_live.py` is an opt-in six-model-task acceptance harness; it creates a
-private fixture under `~/projects` and writes an ignored report. It requires six
-slots and provider quota; never run it against a busy shared broker. `--resume`
+private fixture under `~/projects` and writes an ignored report. It queues six
+tasks over one to six configured slots and consumes provider quota; use an idle broker. `--resume`
 rechecks an existing report without submitting new model tasks. CI uses offline
 tests only. No user-specific benchmark data, task traces or prompts are published.
 

@@ -591,6 +591,19 @@ class ArtifactManager:
 
     # -- public verify ---------------------------------------------------------
 
+    def inspect_verification(self, row):
+        """Read retained evidence without running checks or asserting freshness."""
+        job_id = self._job_id(row['id'])
+        path = self._path(self.verifications, job_id + '.json')
+        record = self._private_json(path)
+        if record is None:
+            return {'job_id': job_id, 'verification_state': 'not_run', 'passed': False,
+                    'reason': 'No retained verification record.', 'checks': [],
+                    'changed_during_checks': None, 'patch_sha256': None, 'workspace_sha256': None,
+                    'attempt_count': 0, 'verification_path': str(path),
+                    'evidence_scope': 'retained_snapshot', 'freshness_checked': False}
+        return {**record, 'evidence_scope': 'retained_snapshot', 'freshness_checked': False}
+
     def verify(self, row, checks=None, contract=None, timeout=120):
         """Run trusted explicit argv checks against a frozen worktree.
 

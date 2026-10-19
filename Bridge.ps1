@@ -16,7 +16,7 @@ switch ($Action) {
     'stop' { & wsl.exe -d $taskConfig.distro --exec python3 $taskScript stop }
     'models' { & wsl.exe -d $taskConfig.distro --exec python3 $taskScript call bridge_models }
     'list' { & wsl.exe -d $taskConfig.distro --exec python3 $taskScript call job_list }
-    'test' { & wsl.exe -d $taskConfig.distro --exec python3 -m unittest discover -s $taskRuntime -p test_bridge.py -v }
+    'test' { & wsl.exe -d $taskConfig.distro --exec python3 -m unittest discover -s $taskRuntime -p 'test_*.py' -v }
     'call' {
         if (-not $Tool) { throw 'Provide -Tool and optionally -ArgumentsJson.' }
         $taskArgFile = Join-Path $env:TEMP "codex-opencode-$([guid]::NewGuid().ToString('N')).json"

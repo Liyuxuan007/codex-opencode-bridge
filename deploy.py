@@ -39,7 +39,7 @@ def main():
                 if probe.connect_ex(('127.0.0.1', bridge.CONFIG['broker_port'])) != 0:
                     break
     target.mkdir(parents=True, exist_ok=True)
-    for name in ['bridge.py', 'control_plane.py', 'artifacts.py', 'test_bridge.py',
+    for name in ['bridge.py', 'control_plane.py', 'artifacts.py', 'workflow.py', 'test_workflow.py', 'test_bridge.py',
                  'test_control_plane.py', 'test_artifacts.py', 'test_integration.py', 'verify_live.py', 'deploy.py']:
         destination = target / name
         if destination.resolve() != (source / name).resolve():

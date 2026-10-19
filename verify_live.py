@@ -73,6 +73,11 @@ def main():
     output = Path(__file__).with_name('acceptance-report.json')
     jobs = []
     try:
+        health = clients[0].call('bridge_health', {})
+        assert not any(health['counts'].get(state, 0) for state in bridge.ACTIVE | {'queued'}), 'Use an idle broker.'
+        slots = health['max_concurrency']
+        assert 1 <= slots <= 6, 'This opt-in fixture supports one to six configured slots.'
+        report['configured_concurrency'] = slots
         tools = clients[0].rpc('tools/list', {})['tools']
         assert any(tool['name'] == 'job_submit' for tool in tools)
         clients[0].call('project_prepare', {'path': str(project), 'create': True, 'initialize_git': True})
@@ -97,7 +102,9 @@ def main():
                     'task': f'Implement tasks/task_{number}.py compute(x) as x * {number} + {number}. '
                             f'Only modify that file. Run python3 -m unittest tests.test_task_{number}. '
                             'Keep the final report short.',
-                    'request_id': f'{project.name}-{number}', 'isolation': 'worktree', 'timeout_seconds': 600}
+                    'request_id': f'{project.name}-{number}', 'isolation': 'worktree', 'timeout_seconds': 600,
+                    'contract': {'allowed_paths': [f'tasks/task_{number}.py'], 'max_changed_files': 1,
+                                 'checks': [[sys.executable, '-B', '-m', 'unittest', f'tests.test_task_{number}']]}}
             result = client.call('job_submit', args)
             assert client.call('job_submit', args)['id'] == result['id']
             return result
@@ -105,7 +112,7 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             jobs = list(pool.map(submit, range(1, 7)))
         report['jobs'] = jobs
-        # All six slots should be occupied before admitting a cancellable seventh job.
+        # Six submitted tasks fill the configured slots and queue additional waves.
         active = [clients[0].call('job_status', {'job_id': job['id']}) for job in jobs]
         report['peak_active'] = sum(job['status'] in bridge.ACTIVE for job in active)
         seventh = clients[0].call('job_submit', {'project': str(project), 'task': 'Reply only QUEUE_PROBE.',
@@ -117,7 +124,7 @@ def main():
         assert cancelled['status'] == 'cancelled'
         report['queued_cancellation'] = True
         pending = {job['id'] for job in jobs}
-        deadline = time.time() + 650
+        deadline = time.time() + 600 * ((6 + slots - 1) // slots) + 60
         while pending and time.time() < deadline:
             states = clients[0].call('job_wait', {'job_ids': sorted(pending), 'seconds': 25})['jobs']
             report['peak_active'] = max(report['peak_active'], sum(job['status'] in bridge.ACTIVE for job in states))
@@ -126,7 +133,7 @@ def main():
                     pending.remove(job['id'])
                     print(json.dumps({'job': job['id'], 'status': job['status'], 'elapsed': round(time.time()-started)}, ensure_ascii=False), flush=True)
         assert not pending, 'Live jobs exceeded acceptance deadline.'
-        results = [clients[0].call('job_result', {'job_id': job['id']}) for job in jobs]
+        results = [clients[0].call('job_result', {'job_id': job['id'], 'view': 'full'}) for job in jobs]
         report['jobs'] = results
         assert all(job['status'] == 'succeeded' for job in results), results
         assert len({job['session_id'] for job in results}) == 6
@@ -139,7 +146,9 @@ def main():
             assert check.returncode == 0, check.stderr
             patch = clients[0].call('job_diff', {'job_id': job['id']})
             assert patch['patch']
-            applied = clients[0].call('job_apply', {'job_id': job['id']})
+            verified = clients[0].call('job_verify', {'job_id': job['id']})
+            assert verified['passed'], verified
+            applied = clients[0].call('job_apply', {'job_id': job['id'], 'patch_sha256': verified['patch_sha256']})
             assert applied['applied']
         report['independent_checks'] = independent
         check = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v'],
@@ -173,7 +182,7 @@ def resume_verification():
     try:
         with (project / '.git/info/exclude').open('a') as exclude:
             exclude.write('\n__pycache__/\n*.py[cod]\n')
-        results = [client.call('job_result', {'job_id': job['id']}) for job in report['jobs']]
+        results = [client.call('job_result', {'job_id': job['id'], 'view': 'full'}) for job in report['jobs']]
         assert len(results) == 6 and all(job['status'] == 'succeeded' for job in results)
         checks = []
         for number, job in enumerate(results, 1):
@@ -184,7 +193,10 @@ def resume_verification():
             checks.append({'job_id': job['id'], 'exit_code': check.returncode, 'output': check.stdout + check.stderr})
             assert check.returncode == 0
             assert client.call('job_diff', {'job_id': job['id']})['patch']
-            assert client.call('job_apply', {'job_id': job['id']})['applied']
+            verified = client.call('job_verify', {'job_id': job['id'],
+                                  'checks': [[sys.executable, '-B', '-m', 'unittest', f'tests.test_task_{number}']]})
+            assert verified['passed'], verified
+            assert client.call('job_apply', {'job_id': job['id'], 'patch_sha256': verified['patch_sha256']})['applied']
         check = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests', '-v'],
                                cwd=project, capture_output=True, text=True)
         assert check.returncode == 0

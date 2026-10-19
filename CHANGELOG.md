@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.0
+
+- Default template concurrency is two, with a documented small-task queue and
+  risk-based independent acceptance workflow in WORKFLOW.md.
+- Optional structured task briefs and risk guidance, plus concise worker report
+  instructions. Model, native agent and reasoning settings are unchanged.
+- Compact status/result/wait and verification responses, with explicit full views,
+  retained usage counters, truncation signals and failure diagnostics.
+- Verification evidence can be inspected without rerunning checks; retained
+  snapshots explicitly do not assert freshness.
+- Example config requires independent artifact verification before applying even
+  non-contract worktree jobs. Existing local settings are not silently migrated.
+- Counter-only efficiency summaries and optional manually reported acceptance
+  metrics distinguish missing measurements from zero and cache from new input.
+
+Optional fields remain backward compatible for stored request identities. The
+default response shape is now compact: use view=full for session/workspace and
+legacy result metadata, or result_view=full in local config. No automatic repair,
+same-session follow-up, extra reviewers, model switching or speedup claim is added.
+
 ## 1.2.0
 
 Strong coordinators can define bounded work and retain independently verified evidence.

@@ -62,6 +62,26 @@ class ArtifactTests(unittest.TestCase):
         }
         return row, worktree
 
+    def test_inspect_absent_verification_does_not_run_checks(self):
+        result = self.manager.inspect_verification({'id': 'job_missing'})
+        self.assertEqual(result['verification_state'], 'not_run')
+        self.assertFalse(result['passed'])
+        self.assertFalse(result['freshness_checked'])
+        self.assertEqual(result['checks'], [])
+
+    def test_inspect_retained_record_does_not_rerun_or_assert_freshness(self):
+        from unittest.mock import patch
+        row, workspace = self.job()
+        record = self.manager.verify(row, self.check_ok())
+        original_bytes = Path(record['verification_path']).read_bytes()
+        (workspace / 'src/app.py').write_text('changed after verification\n')
+        with patch.object(self.manager, '_run_check', side_effect=AssertionError('must not execute')):
+            result = self.manager.inspect_verification(row)
+        self.assertEqual(result['verification_state'], record['verification_state'])
+        self.assertFalse(result['freshness_checked'])
+        self.assertEqual(result['evidence_scope'], 'retained_snapshot')
+        self.assertEqual(Path(record['verification_path']).read_bytes(), original_bytes)
+
     def check_ok(self):
         return [[sys.executable, '-c', 'print("ok")']]
 

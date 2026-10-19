@@ -3,7 +3,10 @@
   "opencode_bin": "~/.local/bin/opencode",
   "opencode_port": 48186,
   "broker_port": 48187,
-  "max_concurrency": 6,
+  "max_concurrency": 2,
+  "result_view": "compact",
+  "result_max_chars": 2500,
+  "check_output_chars": 2000,
   "stale_warning_seconds": 120,
   "default_model": "opencode-go/deepseek-v4.1-flash",
   "allowed_providers": ["opencode-go"],
@@ -15,7 +18,7 @@
     "code_fast": {"model": "opencode-go/deepseek-v4.1-flash", "isolation": "worktree"}
   },
   "enable_questions": false,
-  "require_verification": false,
+  "require_verification": true,
   "allowed_roots": [
     "~/projects"
   ],

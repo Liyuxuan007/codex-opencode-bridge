@@ -16,6 +16,124 @@ from unittest.mock import Mock, patch
 import bridge
 from test_bridge import spec
 
+class EfficiencyIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.broker = object.__new__(bridge.Broker)
+        self.broker.store = bridge.Store(Path(self.temp.name) / 'jobs.db')
+        self.broker.notify = lambda: None
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_two_slots_preserve_queue_for_next_wave(self):
+        for number in range(4):
+            self.broker.store.submit(spec(number))
+        first = self.broker.store.claim(2)
+        second = self.broker.store.claim(2)
+        self.assertNotEqual(first, second)
+        self.assertIsNone(self.broker.store.claim(2))
+        self.broker.store.update(first, status='succeeded')
+        self.assertIsNotNone(self.broker.store.claim(2))
+
+    def test_compact_result_preserves_usage_and_storage_full_is_available(self):
+        original = {'text': 'x' * 5000, 'partial': True,
+                    'session_usage': {'assistant_turns': 3, 'tokens': {'input': 7, 'cache_read': 80}},
+                    'verification': 'Independent acceptance still required.',
+                    'last_message_usage': {'tokens': {'input': 2}}}
+        identifier, _ = self.broker.store.submit(spec())
+        self.broker.store.update(identifier, status='timed_out', result=json.dumps(original),
+                                 error='Deadline reached', workspace='/synthetic', session_id='synthetic')
+        compact = self.broker.call('job_result', {'job_id': identifier, 'view': 'compact', 'max_chars': 100})
+        self.assertEqual(len(compact['result']['text']), 100)
+        self.assertTrue(compact['result']['truncated'])
+        self.assertTrue(compact['result']['partial'])
+        self.assertEqual(compact['result']['session_usage'], original['session_usage'])
+        self.assertEqual(compact['next_action'], 'job_result')
+        self.assertNotIn('session_id', compact)
+        full = self.broker.call('job_result', {'job_id': identifier, 'view': 'full'})
+        self.assertEqual(full['result']['text'], original['text'])
+        self.assertEqual(full['result']['last_message_usage'], original['last_message_usage'])
+        self.assertEqual(json.loads(self.broker.store.get(identifier)['result']), original)
+
+    def test_risk_and_brief_are_frozen_and_idempotency_detects_changes(self):
+        self.broker.catalog = lambda: ['opencode-go/test']
+        args = {'project': '/synthetic', 'task': 'bounded', 'model': 'opencode-go/test',
+                'request_id': 'brief-task', 'isolation': 'readonly', 'risk': 'high',
+                'brief': {'goal': 'Stable cancellation', 'acceptance': ['Unknown abort retains slot.']}}
+        with patch.object(bridge, 'project_path', return_value='/synthetic'):
+            job = self.broker.submit(args)
+            self.assertTrue(self.broker.submit(args)['deduplicated'])
+            with self.assertRaises(ValueError):
+                self.broker.submit(dict(args, risk='low'))
+        saved = json.loads(self.broker.store.get(job['id'])['spec'])
+        self.assertEqual(saved['brief'], args['brief'])
+        self.assertEqual(saved['risk'], 'high')
+
+    def test_optional_fields_do_not_change_legacy_request_identity(self):
+        legacy = spec(isolation='readonly')
+        identifier, _ = self.broker.store.submit(legacy)
+        self.broker.catalog = lambda: ['opencode-go/test']
+        with patch.object(bridge, 'project_path', return_value=legacy['project']):
+            retried = self.broker.submit(legacy)
+        self.assertEqual(retried['id'], identifier)
+        self.assertTrue(retried['deduplicated'])
+
+    def test_explicit_null_brief_fails_before_admission(self):
+        self.broker.catalog = lambda: ['opencode-go/test']
+        with patch.object(bridge, 'project_path', return_value='/synthetic'), self.assertRaises(ValueError):
+            self.broker.submit({'project': '/synthetic', 'task': 'bounded', 'model': 'opencode-go/test',
+                                'isolation': 'readonly', 'request_id': 'null-brief', 'brief': None})
+        self.assertEqual(self.broker.store.rows(), [])
+
+    def test_verification_inspection_reads_without_executing(self):
+        identifier, _ = self.broker.store.submit(spec())
+        manager = Mock()
+        manager.inspect_verification.return_value = {'job_id': identifier, 'verification_state': 'not_run',
+                                                     'passed': False, 'freshness_checked': False}
+        with patch.object(self.broker, 'artifacts', return_value=manager):
+            record = self.broker.call('job_verify', {'job_id': identifier, 'action': 'inspect', 'view': 'full'})
+            self.assertFalse(record['passed'])
+            manager.verify.assert_not_called()
+            manager.inspect_verification.assert_called_once()
+            with self.assertRaises(ValueError):
+                self.broker.call('job_verify', {'job_id': identifier, 'action': 'inspect', 'checks': []})
+
+    def test_failure_verification_keeps_evidence_and_shortens_only_view(self):
+        identifier, _ = self.broker.store.submit(spec())
+        check = {'argv': ['fixture-check'], 'exit_code': 7, 'passed': False, 'timed_out': False,
+                 'error': None, 'duration_seconds': 0.1, 'stdout': 'x' * 3000, 'stderr': 'failure-detail',
+                 'stdout_truncated': True, 'stderr_truncated': False}
+        record = {'job_id': identifier, 'verification_state': 'failed', 'passed': False,
+                  'reason': 'Check exited 7', 'changed_during_checks': False, 'patch_sha256': 'a',
+                  'workspace_sha256': 'b', 'attempt_count': 1, 'verification_path': '/synthetic', 'checks': [check]}
+        manager = Mock()
+        manager.verify.return_value = record
+        with patch.object(self.broker, 'artifacts', return_value=manager), patch.dict(bridge.CONFIG, {'check_output_chars': 30}):
+            result = self.broker.call('job_verify', {'job_id': identifier, 'view': 'compact'})
+            self.assertFalse(result['passed'])
+            self.assertEqual(result['verification_state'], 'failed')
+            self.assertEqual(result['checks'][0]['stderr'], 'failure-detail')
+            self.assertEqual(result['checks'][0]['exit_code'], 7)
+            self.assertTrue(result['checks'][0]['stdout_truncated'])
+            self.assertEqual(len(result['checks'][0]['stdout']), 30)
+            self.assertEqual(len(record['checks'][0]['stdout']), 3000)
+
+    def test_zero_output_limit_returns_no_tail_and_marks_truncation(self):
+        with patch.object(bridge, 'project_path', return_value=self.temp.name), patch.dict(bridge.CONFIG, {'check_output_chars': 0}):
+            result = self.broker.call('run_check', {'project': self.temp.name,
+                     'argv': [bridge.sys.executable, '-c', 'print("sample output")'], 'view': 'compact'})
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(result['stdout'], '')
+        self.assertTrue(result['truncated'])
+
+    def test_invalid_output_settings_rejected(self):
+        for key, value in [('result_view', 'other'), ('result_max_chars', True), ('check_output_chars', -1)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                bridge.validate_config(dict(bridge.CONFIG, **{key: value}))
+        with self.assertRaises(ValueError):
+            self.broker.call('job_status', {'job_id': 'unused', 'view': 'other'})
+
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -145,7 +263,7 @@ class IntegrationTests(unittest.TestCase):
         state = root / 'isolated-state'
         project = root / 'project'
         project.mkdir()
-        for name in ('bridge.py', 'control_plane.py', 'artifacts.py'):
+        for name in ('bridge.py', 'control_plane.py', 'artifacts.py', 'workflow.py'):
             shutil.copy2(Path(bridge.__file__).parent / name, runtime / name)
         stopped = threading.Event()
         values = {'answered': False, 'reply_count': 0}

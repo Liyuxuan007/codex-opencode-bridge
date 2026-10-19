@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from workflow import compact_job, normalize_workflow, worker_prompt
 from control_plane import ModelCatalog, cancel_job, recover_job, QuestionChannel, quota_block_reason
 from artifacts import ArtifactManager, normalize_contract
 
@@ -42,6 +43,12 @@ if not STATE.is_absolute():
 def validate_config(config):
     if isinstance(config.get('max_concurrency'), bool) or not isinstance(config.get('max_concurrency'), int) or config['max_concurrency'] < 1:
         raise ValueError('max_concurrency must be a positive integer.')
+    if config.get('result_view', 'compact') not in ('compact', 'full'):
+        raise ValueError('result_view must be compact or full.')
+    for key, default in (('result_max_chars', 2500), ('check_output_chars', 2000)):
+        value = config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 60000:
+            raise ValueError(key + ' must be an integer between 0 and 60000.')
     for key in ('provider_caps', 'model_caps'):
         limits = config.get(key, {})
         if not isinstance(limits, dict) or any(not isinstance(k, str) or not k or isinstance(v, bool) or not isinstance(v, int) or v < 1 for k, v in limits.items()):
@@ -58,7 +65,7 @@ def validate_config(config):
         raise ValueError('worker_profiles must contain explicit model/isolation objects.')
 
 validate_config(CONFIG)
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 TERMINAL = {'succeeded', 'failed', 'cancelled', 'timed_out'}
 JOB_LOCKS = [threading.RLock() for _ in range(64)]
 
@@ -69,13 +76,19 @@ ACTIVE = {'starting', 'admitting', 'running', 'cancelling', 'attention_required'
 INSTRUCTIONS = '''Delegate bounded implementation, investigation, or test work to OpenCode in WSL.
 Call bridge_health then project_prepare with the intended project path. Prefer Linux projects under
 ~/projects (expand ~ to the Linux home directory). Use job_submit once per independent task, with unique request_id and owner.
+Default to two concurrent workers; use one for coupled work and three only for independent modules or review.
+Queue more small tasks than slots rather than enlarging tasks. Define goal, interfaces, acceptance and stop_conditions
+in brief; use risk low/standard/high for review depth. Risk is guidance, never a verification bypass.
 The shared broker caps ALL clients at the configured max_concurrency; do not start separate OpenCode processes or nested
 subagents. Parallel writing tasks use worktree isolation. readonly is a tool policy, not an OS sandbox.
 Sessions are never shared between tasks. A succeeded job means the agent finished, NOT that its code
-is correct. Inspect job_result and job_diff, run relevant verification, then job_apply only after review.
+is correct. Read compact job_result first; request view=full only for needed diagnostics. Inspect job_diff,
+run relevant verification, then job_apply only after review. Prefer programmatic checks before model review.
 Prefer worktree task contracts with allowed paths and coordinator-supplied checks. Call job_verify,
 then apply the reviewed patch_sha256. Use job_recover for uncertain execution; never replay a prompt.
-Use job_wait in batches of up to eight IDs (at most 30 seconds), not frequent status polling.
+Use job_wait in batches of up to eight IDs (at most 30 seconds), retain after_event_id and remove completed IDs.
+Do not retrieve unchanged results or full successful logs. Collect concrete failures into one bounded repair brief.
+No automatic repair or same-session follow-up exists: a repair submission is explicit and creates a new session.
 For multi-Codex orchestration, let specialists submit jobs and return their IDs; the primary agent
 centrally batch-waits and resumes specialists only for review, instead of every specialist polling.
 If progress reports a stale warning, inspect the tool/session before deciding to cancel; do not
@@ -412,6 +425,13 @@ class Broker:
             raise ValueError('Invalid request_id.')
         spec = {'project': project, 'task': task, 'model': model, 'owner': args.get('owner', 'main'),
                 'isolation': isolation, 'timeout_seconds': timeout, 'request_id': request_id}
+        if 'brief' in args and not isinstance(args['brief'], dict):
+            raise ValueError('brief must be an object when supplied.')
+        workflow = normalize_workflow(args)
+        # Preserve old request identities when callers omit new optional fields.
+        for key in ('risk', 'brief'):
+            if key in args:
+                spec[key] = workflow[key]
         if profile is not None:
             spec['profile'] = profile
         if args.get('contract') is not None:
@@ -561,11 +581,7 @@ class Broker:
                     sid = session['id']
                     self.store.update(job_id, session_id=sid)
                     self.store.update(job_id, status='admitting')
-                    task = (f"Work only in {workspace}. Complete this bounded task: do not delegate to subagents, "
-                            "do not git commit/push, do not deploy or send messages. Run relevant checks when allowed. "
-                            "Finish with a concise summary, changed files, actual check results, and unresolved issues.\n\n" + spec['task'])
-                    if spec.get('contract'):
-                        task += '\n\nAcceptance contract (scope rules are enforced on the resulting patch):\n' + json.dumps(spec['contract'])
+                    task = worker_prompt(workspace, spec)
                     oc(f'/session/{sid}/prompt_async', 'POST', {
                         'model': {'providerID': provider, 'modelID': model}, 'agent': 'build',
                         'tools': {'task': False, 'question': bool(spec.get('questions'))}, 'parts': [{'type': 'text', 'text': task}]}, workspace)
@@ -697,11 +713,21 @@ class Broker:
         return row, Path(path).read_bytes(), path
 
     def call(self, name, args):
+        view = args.get('view', CONFIG.get('result_view', 'compact'))
+        if view not in ('compact', 'full'):
+            raise ValueError('view must be compact or full.')
+        limit = args.get('max_chars', CONFIG.get('result_max_chars', 2500) if view == 'compact' else 12000)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 100000:
+            raise ValueError('max_chars must be an integer between 0 and 100000.')
+        def present(payload):
+            return compact_job(payload, min(limit, 60000)) if view == 'compact' else payload
         if name == 'bridge_health':
             with self.store.connect() as connection:
                 counts = {r['status']: r['n'] for r in connection.execute('SELECT status,COUNT(*) n FROM jobs GROUP BY status')}
             return {'version': VERSION, 'opencode': oc('/global/health'), 'max_concurrency': CONFIG['max_concurrency'],
-                    'default_model': CONFIG['default_model'], 'counts': counts, 'allowed_roots': CONFIG['allowed_roots']}
+                    'default_model': CONFIG['default_model'], 'counts': counts, 'allowed_roots': CONFIG['allowed_roots'],
+                    'result_view': CONFIG.get('result_view', 'compact'),
+                    'require_verification': CONFIG.get('require_verification', False)}
         if name == 'bridge_models':
             self.catalog()
             return self.model_catalog.list(refresh=bool(args.get('refresh', False)))
@@ -722,9 +748,9 @@ class Broker:
         if name == 'job_submit':
             return self.submit(args)
         if name == 'job_list':
-            return {'jobs': [self.brief(r) for r in self.store.rows(min(100, max(1, int(args.get('limit', 20)))))]}
+            return {'jobs': [present(self.brief(r)) for r in self.store.rows(min(100, max(1, int(args.get('limit', 20)))))]}
         if name == 'job_status':
-            return self.brief(self.store.get(args['job_id']))
+            return present(self.brief(self.store.get(args['job_id'])))
         if name == 'job_result':
             row = self.store.get(args['job_id'])
             result = json.loads(row['result']) if row['result'] else None
@@ -738,10 +764,11 @@ class Broker:
                 except Exception:
                     pass
             if result:
-                limit = min(60000, max(1000, int(args.get('max_chars', 12000))))
-                result['truncated'] = len(result['text']) > limit
-                result['text'] = result['text'][:limit]
-            return self.brief(row) | {'result': result}
+                if view == 'full':
+                    result['text_chars'] = len(result.get('text', ''))
+                    result['truncated'] = result['text_chars'] > min(limit, 60000)
+                    result['text'] = result.get('text', '')[:min(limit, 60000)]
+            return present(self.brief(row) | {'result': result})
         if name == 'job_wait':
             ids = args['job_ids']
             if not isinstance(ids, list) or not 1 <= len(ids) <= 8:
@@ -753,7 +780,7 @@ class Broker:
                 questions = any(json.loads(r['progress'] or '{}').get('pending_questions') for r in rows)
                 changed = args.get('after_event_id') is not None and cursor > args['after_event_id']
                 if any(row['status'] in TERMINAL | {'attention_required'} for row in rows) or questions or changed or time.time() >= deadline:
-                    return {'jobs': [self.brief(row) for row in rows], 'event_id': cursor, 'changed': bool(changed)}
+                    return {'jobs': [present(self.brief(row)) for row in rows], 'event_id': cursor, 'changed': bool(changed)}
                 with self.changed:
                     self.changed.wait(min(1, max(0, deadline - time.time())))
         if name == 'job_cancel':
@@ -791,9 +818,12 @@ class Broker:
             result = subprocess.run(command, cwd=directory, env=env, capture_output=True, timeout=timeout)
             stdout = result.stdout.decode('utf-8', errors='replace')
             stderr = result.stderr.decode('utf-8', errors='replace')
+            output_limit = CONFIG.get('check_output_chars', 2000) if view == 'compact' else 12000
             return {'cwd': directory, 'argv': command, 'exit_code': result.returncode,
-                    'stdout': stdout[-12000:], 'stderr': stderr[-12000:],
-                    'truncated': len(stdout) > 12000 or len(stderr) > 12000}
+                    'stdout': stdout[-output_limit:] if output_limit else '',
+                    'stderr': stderr[-output_limit:] if output_limit else '',
+                    'stdout_chars': len(stdout), 'stderr_chars': len(stderr),
+                    'truncated': len(stdout) > output_limit or len(stderr) > output_limit, 'view': view}
         if name == 'job_diff':
             row, patch, path = self.diff(args['job_id'])
             limit = min(100000, max(1000, int(args.get('max_chars', 20000))))
@@ -802,10 +832,35 @@ class Broker:
         if name == 'job_verify':
             row = self.store.get(args['job_id'])
             contract = json.loads(row['spec']).get('contract')
+            action = args.get('action', 'run')
+            if action not in ('run', 'inspect'):
+                raise ValueError('Verification action must be run or inspect.')
+            if action == 'inspect' and ('checks' in args or 'timeout_seconds' in args):
+                raise ValueError('Inspection does not accept check execution arguments.')
             checks = args.get('checks')
             if checks is None:
                 checks = (contract or {}).get('checks', [])
-            return self.artifacts().verify(row, checks, contract, timeout=min(900, max(1, int(args.get('timeout_seconds', 120)))))
+            record = (self.artifacts().inspect_verification(row) if action == 'inspect' else
+                      self.artifacts().verify(row, checks, contract, timeout=min(900, max(1, int(args.get('timeout_seconds', 120))))))
+            if view == 'full':
+                return record
+            # Full evidence remains on disk; compact responses never imply independent code review.
+            summary = {key: record[key] for key in ('job_id', 'verification_state', 'passed', 'reason',
+                       'changed_during_checks', 'patch_sha256', 'workspace_sha256', 'attempt_count', 'verification_path')}
+            for key in ('evidence_scope', 'freshness_checked'):
+                if key in record:
+                    summary[key] = record[key]
+            summary['checks'] = []
+            output_limit = CONFIG.get('check_output_chars', 2000)
+            for check in record['checks']:
+                item = {key: check.get(key) for key in ('argv', 'exit_code', 'passed', 'timed_out', 'error', 'duration_seconds')}
+                for stream in ('stdout', 'stderr'):
+                    output = check.get(stream, '')
+                    retained = output_limit if not check.get('passed') else min(256, output_limit)
+                    item[stream] = output[-retained:] if retained else ''
+                    item[stream + '_truncated'] = bool(check.get(stream + '_truncated')) or len(output) > retained
+                summary['checks'].append(item)
+            return summary | {'view': 'compact', 'detail_hint': 'Use view=full for retained verification details.'}
         if name == 'job_cleanup':
             row = self.store.get(args['job_id'])
             return self.artifacts().cleanup(row, json.loads(row['spec'])['project'],
@@ -842,6 +897,7 @@ def schema(properties=None, required=None):
 S = {'type': 'string'}
 I = {'type': 'integer'}
 B = {'type': 'boolean'}
+V = {'type': 'string', 'enum': ['compact', 'full']}
 TOOLS = [
     ('bridge_health', 'Check WSL OpenCode readiness, shared queue, limits and project roots.', schema()),
     ('bridge_models', 'List explicitly allowed provider models; optional refresh bypasses the TTL cache. Visibility is not billing entitlement.', schema({'refresh': B})),
@@ -849,18 +905,20 @@ TOOLS = [
      schema({'path': S, 'create': B, 'initialize_git': B}, ['path'])),
     ('job_submit', 'Queue one independent OpenCode task. Use worktree for parallel writes; unique request_id makes retries idempotent.',
      schema({'project': S, 'task': S, 'owner': S, 'model': S, 'profile': S, 'contract': {'type': 'object'}, 'questions': B, 'request_id': S,
+             'brief': {'type': 'object'}, 'risk': {'type': 'string', 'enum': ['low', 'standard', 'high']},
              'isolation': {'type': 'string', 'enum': ['worktree', 'readonly', 'exclusive']}, 'timeout_seconds': I}, ['project', 'task', 'request_id'])),
-    ('job_list', 'List recent tasks from all Codex callers sharing this broker.', schema({'limit': I})),
-    ('job_status', 'Read one task status without retrieving its full output.', schema({'job_id': S}, ['job_id'])),
+    ('job_list', 'List recent tasks; compact by default, view=full for session/workspace metadata.', schema({'limit': I, 'view': V})),
+    ('job_status', 'Read task status; compact by default, view=full for session/workspace metadata.', schema({'job_id': S, 'view': V}, ['job_id'])),
     ('job_result', 'Retrieve task output, cumulative session usage, and partial timeout diagnostics. Success still needs independent verification.',
-     schema({'job_id': S, 'max_chars': I}, ['job_id'])),
+     schema({'job_id': S, 'max_chars': I, 'view': V}, ['job_id'])),
     ('job_wait', 'Wait up to 30 seconds for any of 1–8 tasks to finish; omit already completed IDs on subsequent waits.',
-     schema({'job_ids': {'type': 'array', 'items': S, 'minItems': 1, 'maxItems': 8}, 'seconds': I, 'after_event_id': I}, ['job_ids'])),
+     schema({'job_ids': {'type': 'array', 'items': S, 'minItems': 1, 'maxItems': 8}, 'seconds': I, 'after_event_id': I, 'view': V}, ['job_ids'])),
     ('job_cancel', 'Cancel the specified queued/running job without cancelling its siblings.', schema({'job_id': S}, ['job_id'])),
     ('job_recover', 'Inspect uncertain execution, request abort, or reattach without replaying a prompt.',
      schema({'job_id': S, 'action': {'type': 'string', 'enum': ['inspect', 'abort', 'reattach']}}, ['job_id'])),
-    ('job_verify', 'Run coordinator-supplied checks, freeze patch/input hashes, and persist acceptance evidence.',
-     schema({'job_id': S, 'checks': {'type': 'array', 'items': {'type': 'array', 'items': S}}, 'timeout_seconds': I}, ['job_id'])),
+    ('job_verify', 'Run independent checks and persist evidence, or action=inspect to read retained evidence without rerunning. Inspection does not assert freshness.',
+     schema({'job_id': S, 'checks': {'type': 'array', 'items': {'type': 'array', 'items': S}}, 'timeout_seconds': I, 'view': V,
+             'action': {'type': 'string', 'enum': ['run', 'inspect']}}, ['job_id'])),
     ('job_cleanup', 'Preview or remove an owned finished worktree. Unintegrated artifacts need explicit discard.',
      schema({'job_id': S, 'dry_run': B, 'discard': B}, ['job_id'])),
     ('job_questions', 'Inspect pending native clarification questions, or reconcile an uncertain answer without resending.',
@@ -868,7 +926,7 @@ TOOLS = [
     ('job_answer', 'Answer one pending clarification with an idempotency key; no permission escalation.',
      schema({'job_id': S, 'question_id': S, 'answer_id': S, 'answers': {'type': 'array', 'items': {'type': 'array', 'items': S}}}, ['job_id', 'question_id', 'answer_id', 'answers'])),
     ('run_check', 'Run an explicit verification command in a project or finished writing-task workspace. No model call or implicit shell; returns actual exit code.',
-     schema({'project': S, 'job_id': S, 'argv': {'type': 'array', 'items': S, 'minItems': 1}, 'timeout_seconds': I}, ['argv'])),
+     schema({'project': S, 'job_id': S, 'argv': {'type': 'array', 'items': S, 'minItems': 1}, 'timeout_seconds': I, 'view': V}, ['argv'])),
     ('job_diff', 'Inspect the complete patch artifact of a finished worktree task; output is bounded.',
      schema({'job_id': S, 'max_chars': I}, ['job_id'])),
     ('job_apply', 'Apply a reviewed successful worktree patch to its source directory after git apply --check. No commit or push.',

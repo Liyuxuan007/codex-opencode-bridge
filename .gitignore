@@ -10,6 +10,10 @@
 !.env.example
 !config.example.json
 !bridge.py
+!workflow.py
+!test_workflow.py
+!scripts/test_measure_usage.py
+!WORKFLOW.md
 !control_plane.py
 !artifacts.py
 !test_control_plane.py

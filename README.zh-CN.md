@@ -3,15 +3,34 @@
 [English and complete tool reference](README.md) · [安全说明](SECURITY.md)
 
 使用 Python 标准库，将 Codex 的任务经 MCP 交给 WSL 中的常驻 OpenCode。
-多个 Codex 调用方共用 SQLite 队列和全局并发上限（默认 6），每个任务使用独立
+多个 Codex 调用方共用 SQLite 队列和全局并发上限（默认 2），每个任务使用独立
 会话，并行写任务使用独立 Git worktree。桥接不复制或转换订阅凭证，也不绕过额度。
 本项目不是 OpenAI 或 OpenCode 的官方产品。
+
+## 默认协作流程（1.3.0）
+
+建议一个 Codex 协调者、两个 OpenCode 执行槽位，小任务分批排队；确有独立工作时
+再考虑三个。模型及思考强度保持不变。完整任务模板与验收流程见 [WORKFLOW.md](WORKFLOW.md)。
+
+- `job_submit` 可传 `brief`（goal、interfaces、acceptance、stop_conditions）和
+  `risk`（low、standard、high），明确文件归属、接口、失败路径与停止条件。
+- 执行者按 STATUS / CHANGES / CHECKS / RISKS / DECISIONS 简短交付；这是提示词约定，
+  不代表输出经过结构化校验或代码已正确。
+- 状态、结果、等待及验证默认精简；`view="full"` 按需读取完整视图。结果默认 2500
+  字符，检查输出默认每流 2000 字符，成功验证每流最多 256 字符，截断均明确标记。
+- 模板启用 `require_verification=true`；先运行独立验证，再按风险审查补丁，最后串行
+  应用及集成检查。已有私有配置需明确更新，不能靠拉取模板自动生效。
+- 计量导出器可用 `--assessment` 加入人工记录的首次验收、返工、集成失败和墙钟时间；
+  未测量为 null，不以执行 succeeded 推断验收通过，不把并行执行耗时相加。
+
+当前无自动修复派工，也无同一会话追加任务。修复须明确创建新任务、新 request_id，
+使用审阅过的已提交基线；恢复监控不会重发提示词。尚未实测宣称提速或节省百分比。
 
 ## 安装
 
 要求 WSL2、Python 3.10+、Git、已登录的 OpenCode CLI，以及 Windows Codex CLI。
 已验证环境：Ubuntu 24.04、OpenCode 1.19.2、Codex CLI 0.163.0-alpha.10.2。
-桥接版本 1.2.0。默认模型示例为 `opencode-go/deepseek-v4.1-flash`，具体 revision
+桥接版本 1.3.0。默认模型示例为 `opencode-go/deepseek-v4.1-flash`，具体 revision
 由提供商管理；安装前确认账户可用模型。代码不包含模型权重、数据集或向量库。
 
 1. 克隆仓库到 WSL 可访问的位置。
@@ -77,7 +96,7 @@ task 工具仍禁用，执行者不再创建执行者。当前不自动派发修
 
 ## 验证和上传防护
 
-离线回归：`python3 -m unittest test_bridge -v`。发布策略测试：
+离线回归：`python3 -m unittest discover -s . -p 'test_*.py' -v`。发布策略测试：
 `python3 -m unittest discover -s scripts -p 'test_*.py' -v`。
 `verify_live.py` 会使用六个模型任务并保留本地测试项目及报告，应只在有额度、配置正确
 且共享服务空闲时主动运行，CI 不调用模型。`--resume` 可复核已有报告。
