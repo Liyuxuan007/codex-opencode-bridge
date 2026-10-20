@@ -7,6 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWED = {
+    'verify_native.py', 'test_incident.py',
     'workflow.py', 'test_workflow.py', 'scripts/test_measure_usage.py', 'WORKFLOW.md',
     'control_plane.py', 'artifacts.py', 'test_control_plane.py', 'test_artifacts.py',
     'test_integration.py', 'CHANGELOG.md', 'scripts/measure_usage.py',

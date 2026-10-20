@@ -293,6 +293,8 @@ class IntegrationTests(unittest.TestCase):
                     self.send_json({'all': [{'id': 'opencode-go', 'models': {'test': {}}}], 'connected': ['opencode-go']})
                 elif route == '/session/status':
                     self.send_json({'s1': {'type': 'idle' if values['answered'] else 'busy'}})
+                elif route == '/session/s1':
+                    self.send_json({'id': 's1', 'permission': values['permissions']})
                 elif route == '/question':
                     self.send_json([] if values['answered'] else [{'id': 'q1', 'sessionID': 's1', 'questions': [{'question': 'Choose fixture?', 'options': [{'label': 'yes'}]}]}])
                 elif route == '/session/s1/message':
@@ -309,7 +311,11 @@ class IntegrationTests(unittest.TestCase):
                     values['permissions'] = body['permission']
                     self.send_json({'id': 's1'})
                 elif route == '/session/s1/prompt_async':
-                    values['tools'] = body['tools']
+                    values['tools'] = body.get('tools')
+                    # Match the real 1.19.2 replacement behavior, not an idealized API.
+                    if body.get('tools'):
+                        values['permissions'] = [{'permission': key, 'pattern': '*', 'action': 'allow' if enabled else 'deny'}
+                                                 for key, enabled in body['tools'].items()]
                     self.send_json(True)
                 elif route == '/question/q1/reply':
                     values['reply_count'] += 1
@@ -349,8 +355,10 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(result['jobs'][0]['status'], 'succeeded')
             self.assertTrue(client.call('job_answer', answer)['already_answered'])
             self.assertEqual(values['reply_count'], 1)
-            self.assertFalse(values['tools']['task'])
-            self.assertTrue(values['tools']['question'])
+            self.assertIsNone(values['tools'])
+            self.assertIn({'permission': 'task', 'pattern': '*', 'action': 'deny'}, values['permissions'])
+            self.assertIn({'permission': 'question', 'pattern': '*', 'action': 'allow'}, values['permissions'])
+            self.assertIn({'permission': 'bash', 'pattern': '*', 'action': 'deny'}, values['permissions'])
         finally:
             if client:
                 client.close()

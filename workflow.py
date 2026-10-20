@@ -20,9 +20,29 @@ MAX_BRIEF_ITEM_CHARS = 1000
 MAX_ERROR_CHARS = 1000
 MAX_GIT_STATUS_CHARS = 1000
 MAX_RUNNING_TOOLS = 4
-ESSENTIAL_KEYS = ('id', 'status', 'owner', 'model', 'isolation', 'risk', 'timing',
+ESSENTIAL_KEYS = ('id', 'status', 'owner', 'model', 'isolation', 'risk', 'timing', 'failure',
                   'next_action', 'error', 'error_code', 'retryable', 'queued_reason')
 _MISSING = object()
+
+
+def worker_permissions(isolation, questions=False):
+    rules = [{'permission': '*', 'pattern': '*', 'action': 'allow'},
+             {'permission': 'task', 'pattern': '*', 'action': 'deny'},
+             {'permission': 'question', 'pattern': '*', 'action': 'allow' if questions else 'deny'},
+             {'permission': 'external_directory', 'pattern': '*', 'action': 'deny'}]
+    if isolation == 'readonly':
+        rules += [{'permission': key, 'pattern': '*', 'action': 'deny'}
+                  for key in ('edit', 'bash', 'apply_patch')]
+    return rules
+
+
+def assert_native_permissions(session, expected):
+    """Fail closed on silent permission loss; order is significant (last match wins)."""
+    rules = session.get('permission') if isinstance(session, dict) else None
+    actual = ([{key: item.get(key) for key in ('permission', 'pattern', 'action')}
+               for item in rules] if isinstance(rules, list) and all(isinstance(r, dict) for r in rules) else None)
+    if actual != expected:
+        raise PermissionError('Native session permissions do not match the requested policy; execution stopped.')
 
 
 def _validate_risk(value):
@@ -329,4 +349,4 @@ def compact_job(payload, max_chars=2500):
     return compacted
 
 
-__all__ = ['normalize_workflow', 'worker_prompt', 'compact_job']
+__all__ = ['normalize_workflow', 'worker_prompt', 'compact_job', 'worker_permissions', 'assert_native_permissions']

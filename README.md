@@ -24,7 +24,7 @@ rate limits still apply. This is not an official OpenAI or OpenCode product.
 - PowerShell and `wsl.exe` for the Windows convenience scripts.
 - OpenCode provider authentication and access to the configured model.
 
-Bridge version: **1.3.0**. Compatibility baseline: Ubuntu 24.04, OpenCode **1.19.2**, and
+Bridge version: **1.3.1**. Compatibility baseline: Ubuntu 24.04, OpenCode **1.19.2**, and
 Windows Codex CLI **0.163.0-alpha.10.2**. No compatibility with future versions is
 implied. The example worker model is **`opencode-go/deepseek-v4.1-flash`**;
 the provider controls that identifier's revision. Use `bridge_models` to check
@@ -202,6 +202,18 @@ Writing modes: `worktree` (default, isolated committed baseline) and `exclusive`
 (direct project edits, mutually exclusive for that project). `readonly` disables
 editing and shell tools but is only a tool policy. It does not permit `run_check`.
 Neither worktrees nor allowed roots are OS sandboxes. See [SECURITY.md](SECURITY.md).
+
+Version 1.3.1 checks native session permissions before and after prompt admission.
+Deprecated prompt `tools` is omitted because OpenCode 1.19.2 replaces the entire
+permission policy when it is present. `python3 verify_native.py` probes this native
+contract using temporary sessions and `noReply=True`, without model inference.
+
+Completed provider errors retain structured `failure` diagnostics. An acknowledged
+abort plus completed-error evidence, no pending tools and absence from active
+status can reconcile termination; absence alone cannot. This does not prove OS
+descendants stopped. `upstream_retryable` never authorizes whole-task replay.
+Timing separates `execution_seconds`, `attention_seconds` and `wall_seconds`.
+Execution is bridge-observed elapsed time; migrated old timestamps are estimates.
 
 `succeeded` means the model returned a completed answer, not that the code is correct.
 Require independent validation. A 120-second stale-progress warning does not

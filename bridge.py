@@ -26,8 +26,9 @@ import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from workflow import compact_job, normalize_workflow, worker_prompt
-from control_plane import ModelCatalog, cancel_job, recover_job, QuestionChannel, quota_block_reason
+from workflow import compact_job, normalize_workflow, worker_prompt, worker_permissions, assert_native_permissions
+from control_plane import (ModelCatalog, cancel_job, recover_job, QuestionChannel, quota_block_reason,
+                           migrate_job_state, update_job, native_failure)
 from artifacts import ArtifactManager, normalize_contract
 
 ROOT = Path(__file__).resolve().parent
@@ -65,7 +66,7 @@ def validate_config(config):
         raise ValueError('worker_profiles must contain explicit model/isolation objects.')
 
 validate_config(CONFIG)
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 TERMINAL = {'succeeded', 'failed', 'cancelled', 'timed_out'}
 JOB_LOCKS = [threading.RLock() for _ in range(64)]
 
@@ -214,6 +215,7 @@ class Store:
             if 'progress' not in columns:
                 connection.execute('ALTER TABLE jobs ADD COLUMN progress TEXT')
             connection.execute('CREATE TABLE IF NOT EXISTS job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, kind TEXT NOT NULL, created REAL NOT NULL)')
+            migrate_job_state(connection)
 
     @contextlib.contextmanager
     def connect(self):
@@ -233,17 +235,9 @@ class Store:
         return dict(row)
 
     def update(self, job_id, *, touch=True, **values):
-        allowed = {'status', 'session_id', 'workspace', 'base_commit', 'result', 'error', 'cancel_requested', 'started', 'progress'}
-        if not values.keys() <= allowed:
-            raise ValueError('Invalid update field.')
-        if touch:
-            values['updated'] = time.time()
         with self.connect() as connection:
-            previous = connection.execute('SELECT status FROM jobs WHERE id=?', (job_id,)).fetchone()
-            connection.execute('UPDATE jobs SET ' + ','.join(k + '=?' for k in values) + ' WHERE id=?',
-                               [*values.values(), job_id])
-            if 'status' in values and previous and previous['status'] != values['status']:
-                connection.execute('INSERT INTO job_events(job_id,kind,created) VALUES(?,?,?)', (job_id, values['status'], time.time()))
+            connection.execute('BEGIN IMMEDIATE')
+            update_job(connection, job_id, values, touch=touch)
 
     def record_event(self, job_id, kind):
         with self.connect() as connection:
@@ -301,7 +295,7 @@ class Store:
                         waiting_exclusive.add(spec['project'])
                     continue
                 now = time.time()
-                connection.execute("UPDATE jobs SET status='starting',updated=?,started=? WHERE id=?", (now, now, row['id']))
+                update_job(connection, row['id'], {'status': 'starting', 'started': now}, now=now)
                 return row['id']
         return None
 
@@ -353,18 +347,29 @@ class Broker:
         progress = json.loads(row['progress']) if row.get('progress') else None
         if progress:
             progress.pop('fingerprint', None)
-            progress['stalled_seconds'] = round(max(0, time.time() - progress['last_progress_at']), 1) if row['status'] in ACTIVE else None
+            observed_end = row.get('execution_ended') or time.time()
+            progress['stalled_seconds'] = round(max(0, observed_end - progress['last_progress_at']), 1) if row['status'] in ACTIVE else None
             for tool in progress.get('running_tools', []):
                 if tool.get('started_at'):
                     tool['elapsed_seconds'] = round(max(0, time.time() - tool['started_at']), 1)
             if row['status'] in ACTIVE and progress['stalled_seconds'] >= CONFIG.get('stale_warning_seconds', 120):
                 progress['warning'] = 'No observable progress. May be tool execution, reasoning, or provider wait; inspect before cancelling.'
+        now = time.time()
+        observed_end = row.get('execution_ended') or (row['updated'] if row['status'] in TERMINAL | {'attention_required'} else now)
+        attention = row.get('attention_seconds') or 0
+        if row.get('attention_since') is not None:
+            attention += max(0, now - row['attention_since'])
+        excluded = (row.get('execution_excluded_seconds') or 0) if row.get('execution_ended') else (row.get('attention_seconds') or 0)
         timing = {'queue_seconds': round(row['started']-row['created'], 3) if row['started'] else None,
-                  'execution_seconds': round(((row['updated'] if row['status'] in TERMINAL else time.time())-row['started']), 3) if row['started'] else None}
+                  'execution_seconds': round(max(0, observed_end-row['started']-excluded), 3) if row['started'] else None,
+                  'attention_seconds': round(attention, 3),
+                  'wall_seconds': round(max(0, ((row.get('finished_at') or row['updated']) if row['status'] in TERMINAL else now)-row['created']), 3),
+                  'execution_clock': 'bridge_observed'}
         result = {key: row[key] for key in ('id', 'status', 'created', 'updated', 'session_id', 'workspace', 'base_commit', 'error')} | {
             'owner': spec['owner'], 'project': spec['project'], 'model': spec['model'],
             'isolation': spec['isolation'], 'request_id': spec['request_id'], 'timing': timing, 'progress': progress,
             'risk': spec.get('risk', 'standard')}
+        result['failure'] = json.loads(row['failure']) if row.get('failure') else None
         result['next_action'] = ('job_recover' if row['status'] in {'attention_required', 'cancelling'} else
                                  'job_verify' if row['status'] == 'succeeded' and spec.get('contract') else
                                  'job_result' if row['status'] in TERMINAL else 'job_wait')
@@ -549,6 +554,7 @@ class Broker:
                 pass  # Preserve the primary error; session/worktree handles remain available.
 
     def run(self, job_id, recovering=False):
+        prompt_attempted = False
         sid = None
         workspace = None
         try:
@@ -569,23 +575,22 @@ class Broker:
                         self.store.update(job_id, status='cancelled')
                         return
                     # Each job owns a new session: no idle-session claim races or cross-task context mixing.
-                    permissions = [{'permission': '*', 'pattern': '*', 'action': 'allow'},
-                                   {'permission': 'task', 'pattern': '*', 'action': 'deny'},
-                                   {'permission': 'question', 'pattern': '*', 'action': 'allow' if spec.get('questions') else 'deny'},
-                                   {'permission': 'external_directory', 'pattern': '*', 'action': 'deny'}]
-                    if spec['isolation'] == 'readonly':
-                        permissions += [{'permission': key, 'pattern': '*', 'action': 'deny'}
-                                        for key in ('edit', 'bash', 'apply_patch')]
+                    permissions = worker_permissions(spec['isolation'], bool(spec.get('questions')))
                     provider, model = spec['model'].split('/', 1)
                     session = oc('/session', 'POST', {'title': f"Bridge {job_id} ({spec['owner']})", 'permission': permissions,
                                                      'agent': 'build', 'model': {'providerID': provider, 'id': model}}, workspace)
                     sid = session['id']
                     self.store.update(job_id, session_id=sid)
+                    assert_native_permissions(oc(f'/session/{sid}', directory=workspace), permissions)
                     self.store.update(job_id, status='admitting')
                     task = worker_prompt(workspace, spec)
+                    prompt_attempted = True  # A lost POST response is ambiguous; never replay it.
                     oc(f'/session/{sid}/prompt_async', 'POST', {
                         'model': {'providerID': provider, 'modelID': model}, 'agent': 'build',
-                        'tools': {'task': False, 'question': bool(spec.get('questions'))}, 'parts': [{'type': 'text', 'text': task}]}, workspace)
+                        'parts': [{'type': 'text', 'text': task}]}, workspace)
+                    # Legacy body.tools replaces session permissions in OpenCode 1.19.2.
+                    # Never send it, and verify the native service retained the policy.
+                    assert_native_permissions(oc(f'/session/{sid}', directory=workspace), permissions)
                     self.store.update(job_id, status='running')
                 elif recovering and row['status'] in ('starting', 'admitting'):
                     # A crash in the admit window is ambiguous; never replay a possibly executed instruction.
@@ -594,10 +599,11 @@ class Broker:
             while True:
                 current = self.store.get(job_id)
                 if current['cancel_requested'] or time.time() >= deadline:
-                    cancel_job(self.store, oc, self.notify, job_id)
+                    cancel_job(self.store, oc, self.notify, job_id,
+                               target_status=current.get('termination_status') or ('cancelled' if current['cancel_requested'] else 'timed_out'))
                     confirmed = self.store.get(job_id)
-                    if not current['cancel_requested'] and confirmed['status'] == 'cancelled':
-                        self.store.update(job_id, status='timed_out', error=f"Execution deadline exceeded ({spec['timeout_seconds']}s).")
+                    if confirmed['status'] == 'timed_out':
+                        self.store.update(job_id, error=f"Execution deadline exceeded ({spec['timeout_seconds']}s).")
                     self.retain_partial(job_id)
                     return
                 messages = oc(f'/session/{sid}/message?limit=2', directory=workspace)
@@ -621,7 +627,9 @@ class Broker:
                 if assistants:
                     last = assistants[-1]
                     if last['info'].get('error'):
-                        raise RuntimeError(json.dumps(last['info']['error'], ensure_ascii=False)[:1800])
+                        failure = native_failure(last['info']['error'])
+                        self.store.update(job_id, failure=json.dumps(failure), touch=False)
+                        raise RuntimeError('Native model request failed: ' + failure['category'] + '. See failure diagnostics.')
                     if last['info'].get('finish') not in (None, 'tool-calls') and last['info'].get('time', {}).get('completed'):
                         break
                 # v1.19.2 advertises /api/session/{id}/wait but returns 503 (not implemented).
@@ -633,8 +641,6 @@ class Broker:
                 condition = self.session_condition(sid)
                 with condition:
                     condition.wait(2)
-            if last['info'].get('error'):
-                raise RuntimeError(json.dumps(last['info']['error'], ensure_ascii=False)[:1800])
             text = '\n'.join(p.get('text', '') for p in last.get('parts', []) if p.get('type') == 'text').strip()
             if not text or not last['info'].get('time', {}).get('completed'):
                 raise RuntimeError('No completed final text was returned. The task is not marked successful.')
@@ -645,21 +651,24 @@ class Broker:
             with self.store.connect() as connection:
                 connection.execute('BEGIN IMMEDIATE')
                 cancelled = connection.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()[0]
-                connection.execute('UPDATE jobs SET status=?,result=?,updated=? WHERE id=?',
-                                   ('cancelled' if cancelled else 'succeeded', json.dumps(result, ensure_ascii=False), time.time(), job_id))
+                update_job(connection, job_id, {'status': 'cancelled' if cancelled else 'succeeded',
+                                               'result': json.dumps(result, ensure_ascii=False)})
                 connection.execute('INSERT INTO job_events(job_id,kind,created) VALUES(?,?,?)',
                                    (job_id, 'completed', time.time()))
         except Exception as error:
             current = self.store.get(job_id)
             requested = bool(current['cancel_requested'])
             status = 'cancelled' if requested else 'failed'
-            if sid and workspace:
+            if sid and workspace and (prompt_attempted or recovering):
                 try:
-                    cancel_job(self.store, oc, self.notify, job_id)
+                    cancel_job(self.store, oc, self.notify, job_id,
+                               target_status=current.get('termination_status') or ('cancelled' if requested else 'failed'))
                     reconciled = self.store.get(job_id)
                     if reconciled['status'] == 'succeeded':
                         return
-                    if reconciled['status'] != 'cancelled':
+                    if reconciled['status'] in ('cancelled', 'failed', 'timed_out'):
+                        status = reconciled['status']
+                    else:
                         status = 'attention_required'
                 except Exception:
                     status = 'attention_required'

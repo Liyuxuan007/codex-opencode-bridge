@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.1
+
+- Remove deprecated prompt `tools`, which overwrites session permission rules in
+  OpenCode 1.19.2. Verify the native permission contract before and after admission.
+- Reconcile completed native errors without requiring `finish=stop`: an explicit
+  abort acknowledgement, absent active status and no pending tools can establish
+  termination. Ambiguous evidence still retains the slot. Never replay prompts.
+- Preserve allowlisted failure diagnostics and distinguish upstream transport
+  retryability from authorization to rerun a whole task.
+- Record state transitions atomically with cancellation/recovery updates. Separate
+  observed execution, attention and wall clocks; migrated timestamps are estimates.
+- Add incident regressions and an opt-in native permission probe using `noReply`;
+  it tests the installed API contract without model inference.
+
 ## 1.3.0
 
 - Default template concurrency is two, with a documented small-task queue and

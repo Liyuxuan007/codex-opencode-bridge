@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import threading
 import time
@@ -28,7 +29,9 @@ __all__ = [
 TERMINAL = {'succeeded', 'failed', 'cancelled', 'timed_out'}
 ACTIVE = {'starting', 'admitting', 'running', 'cancelling', 'attention_required'}
 _JOB_FIELDS = {'status', 'session_id', 'workspace', 'base_commit', 'result', 'error',
-               'cancel_requested', 'started', 'progress'}
+               'cancel_requested', 'started', 'progress', 'execution_ended',
+               'attention_since', 'attention_seconds', 'failure', 'termination_status'}
+_JOB_FIELDS |= {'finished_at', 'execution_excluded_seconds'}
 
 _MAX_QUESTIONS = 10
 _MAX_OPTIONS = 10
@@ -37,6 +40,89 @@ _MAX_TEXT = 500
 
 def _now():
     return time.time()
+
+
+def migrate_job_state(connection):
+    """Additive migration; old status timestamps are estimates, not native completion proof."""
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(jobs)')}
+    for name, kind in {'execution_ended': 'REAL', 'attention_since': 'REAL',
+                       'attention_seconds': 'REAL NOT NULL DEFAULT 0', 'failure': 'TEXT',
+                       'termination_status': 'TEXT', 'finished_at': 'REAL',
+                       'execution_excluded_seconds': 'REAL NOT NULL DEFAULT 0'}.items():
+        if name not in columns:
+            connection.execute('ALTER TABLE jobs ADD COLUMN ' + name + ' ' + kind)
+    connection.execute('CREATE TABLE IF NOT EXISTS job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, kind TEXT NOT NULL, created REAL NOT NULL)')
+    connection.execute("UPDATE jobs SET execution_ended=updated WHERE execution_ended IS NULL AND status IN ('succeeded','failed','cancelled','timed_out','attention_required')")
+    connection.execute("UPDATE jobs SET attention_since=updated WHERE attention_since IS NULL AND status='attention_required'")
+    connection.execute("UPDATE jobs SET finished_at=updated WHERE finished_at IS NULL AND status IN ('succeeded','failed','cancelled','timed_out')")
+
+
+def update_job(connection, job_id, values, *, touch=True, now=None):
+    """Update state, clocks and event cursor in the caller's transaction."""
+    if not values.keys() <= _JOB_FIELDS:
+        raise ValueError('Invalid update field.')
+    previous = connection.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+    if previous is None:
+        raise ValueError('Unknown job ID.')
+    previous = dict(previous)
+    values = dict(values)
+    now = _now() if now is None else now
+    status = values.get('status', previous['status'])
+    changed = status != previous['status']
+    if changed:
+        since = previous.get('attention_since')
+        if previous['status'] == 'attention_required' and since is not None:
+            values['attention_seconds'] = previous.get('attention_seconds', 0) + max(0, now - since)
+            values['attention_since'] = None
+        if status == 'attention_required':
+            values['attention_since'] = now
+        if status in TERMINAL | {'attention_required'} and previous.get('execution_ended') is None:
+            values['execution_ended'] = now
+            values['execution_excluded_seconds'] = values.get('attention_seconds', previous.get('attention_seconds', 0))
+        elif status == 'running':
+            values['execution_ended'] = None
+        if status in TERMINAL:
+            values['finished_at'] = now
+    if touch:
+        values['updated'] = now
+    if values:
+        connection.execute('UPDATE jobs SET ' + ','.join(key + '=?' for key in values) + ' WHERE id=?',
+                           [*values.values(), job_id])
+    if changed:
+        connection.execute('INSERT INTO job_events(job_id,kind,created) VALUES(?,?,?)', (job_id, status, now))
+
+
+def native_failure(error):
+    """Small allowlisted diagnostics; never retain headers, bodies, prompts or full URLs."""
+    data = error.get('data', {}) if isinstance(error, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    meta = data.get('metadata', {})
+    meta = meta if isinstance(meta, dict) else {}
+    raw = str(data.get('message', 'Native model request failed.'))
+    # Error messages may embed URLs or secrets; retain a classification, not arbitrary provider text.
+    category = ('connection_error' if any(word in raw.lower() for word in ('connect', 'network', 'socket', 'tls', 'dns')) else
+                'rate_limit' if 'rate limit' in raw.lower() else 'model_error')
+    name = error.get('name') if isinstance(error, dict) else None
+    result = {'source': 'native_assistant_error', 'category': category,
+              'name': name if name in ('APIError', 'UnknownError', 'MessageAbortedError', 'ProviderAuthError', 'ContextOverflowError') else 'NativeError',
+              'upstream_retryable': data.get('isRetryable') if isinstance(data.get('isRetryable'), bool) else None,
+              'http_status': None, 'transport_code': None, 'request_id': None,
+              'observed_at': _now(), 'automatic_replay': False}
+    url = meta.get('url') or data.get('url')
+    if isinstance(url, str):
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            result['endpoint_host'] = parsed.hostname
+        except ValueError:
+            pass
+    for key, value in (('http_status', data.get('statusCode', meta.get('statusCode'))),
+                       ('transport_code', meta.get('code', data.get('code'))),
+                       ('request_id', meta.get('requestID', meta.get('request_id')))):
+        if key == 'http_status' and isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+            result[key] = value
+        elif key != 'http_status' and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', value):
+            result[key] = value
+    return result
 
 
 def _cfg(config, key, default=None):
@@ -84,6 +170,7 @@ def _brief(row, **extra):
         'owner': spec.get('owner'), 'project': spec.get('project'),
         'model': spec.get('model'), 'isolation': spec.get('isolation'),
         'request_id': spec.get('request_id'),
+        'failure': json.loads(row['failure']) if row.get('failure') else None,
     }
     brief.update(extra)
     return brief
@@ -284,7 +371,7 @@ def _session_evidence(native, sid, workspace):
     evidence = {'session_id': sid, 'native_status': None, 'native_idle': False,
                 'status_map_found': False, 'message_count': None, 'last_finish': None,
                 'last_completed': None, 'last_error': None, 'final_complete': False,
-                'notes': []}
+                'error_complete': False, 'pending_tools': False, 'notes': []}
     statuses = None
     try:
         statuses = native('/session/status', 'GET', None, workspace)
@@ -308,6 +395,9 @@ def _session_evidence(native, sid, workspace):
         evidence['notes'].append('messages unavailable: ' + str(error)[:200])
     if isinstance(messages, list):
         evidence['message_count'] = len(messages)
+        evidence['pending_tools'] = any(part.get('type') == 'tool' and
+                                       part.get('state', {}).get('status') in ('running', 'pending')
+                                       for message in messages for part in message.get('parts', []))
         assistants = [m for m in messages
                       if isinstance(m, dict) and (m.get('info') or {}).get('role') == 'assistant']
         if assistants:
@@ -315,21 +405,30 @@ def _session_evidence(native, sid, workspace):
             evidence['last_finish'] = info.get('finish')
             evidence['last_completed'] = (info.get('time') or {}).get('completed')
             if info.get('error'):
-                evidence['last_error'] = _bounded(info['error'])
+                evidence['failure'] = native_failure(info['error'])
+                evidence['last_error'] = evidence['failure']['category']
+                evidence['error_complete'] = bool(evidence['last_completed'])
             evidence['final_complete'] = (evidence['last_finish'] not in (None, 'tool-calls')
-                                          and bool(evidence['last_completed']))
+                                          and bool(evidence['last_completed']) and not info.get('error'))
     return evidence
 
 
 def _abort_and_reconcile(store, native, job_id, sid, workspace):
     """Abort a native session outside any DB transaction, then reconcile the stored status."""
     abort_error = None
+    acknowledged = False
     try:
-        native(f'/session/{sid}/abort', 'POST', {}, workspace)
+        acknowledged = native(f'/session/{sid}/abort', 'POST', {}, workspace) is True
     except Exception as error:  # noqa: BLE001
         abort_error = str(error)
     evidence = _session_evidence(native, sid, workspace)
-    idle = evidence.get('native_idle') is True or (evidence.get('final_complete') and evidence.get('native_status') not in ('busy', 'running', 'retry'))
+    evidence['abort_acknowledged'] = acknowledged
+    # A completed error lacks finish=stop in OpenCode 1.19.2. Require an explicit
+    # abort acknowledgement plus positive terminal evidence, not map absence alone.
+    absent_with_terminal = (evidence['status_map_found'] and evidence['native_status'] is None and
+                            (evidence['final_complete'] or (acknowledged and evidence['error_complete'])))
+    idle = not evidence['pending_tools'] and (evidence['native_idle'] or absent_with_terminal)
+    evidence['termination_confirmed'] = bool(idle and abort_error is None)
     with store.connect() as connection:
         connection.execute('BEGIN IMMEDIATE')
         fresh = dict(connection.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
@@ -337,21 +436,32 @@ def _abort_and_reconcile(store, native, job_id, sid, workspace):
         if fresh['status'] in TERMINAL:
             outcome = 'terminal_preserved'  # never overwrite a concurrent completion
         elif abort_error:
-            connection.execute("UPDATE jobs SET status='attention_required',error=?,updated=? WHERE id=?",
-                               (('abort not confirmed: ' + abort_error)[:2500], now, job_id))
+            update_job(connection, job_id, {'status': 'attention_required',
+                                          'error': ('abort not confirmed: ' + abort_error)[:2500]}, now=now)
             outcome = 'attention_required'
         elif idle:
-            connection.execute("UPDATE jobs SET status='cancelled',updated=? WHERE id=?", (now, job_id))
-            outcome = 'cancelled'
+            target = fresh.get('termination_status') or ('failed' if evidence['error_complete'] and
+                      evidence.get('failure', {}).get('name') != 'MessageAbortedError' else 'cancelled')
+            values = {'status': target}
+            if evidence.get('failure') and not fresh.get('failure'):
+                values['failure'] = json.dumps(evidence['failure'])
+            if target == 'failed':
+                values['error'] = 'Native model execution failed; see failure diagnostics.'
+            update_job(connection, job_id, values, now=now)
+            outcome = target
         else:
-            connection.execute("UPDATE jobs SET status='attention_required',error=?,updated=? WHERE id=?",
-                               ('Native termination could not be confirmed; inspect or reattach.', now, job_id))
+            values = {'status': 'attention_required', 'error': 'Native termination could not be confirmed; inspect or abort.'}
+            if evidence.get('failure') and not fresh.get('failure'):
+                values['failure'] = json.dumps(evidence['failure'])
+            update_job(connection, job_id, values, now=now)
             outcome = 'attention_required'
     return abort_error, evidence, outcome
 
 
-def cancel_job(store, native, notify, job_id):
+def cancel_job(store, native, notify, job_id, target_status='cancelled'):
     """Replacement for ``bridge.Broker.cancel`` with transactional, evidence-based semantics."""
+    if target_status not in ('cancelled', 'failed', 'timed_out'):
+        raise ValueError('Invalid termination target.')
     with store.connect() as connection:
         connection.execute('BEGIN IMMEDIATE')
         row = connection.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -362,13 +472,12 @@ def cancel_job(store, native, notify, job_id):
         if status in TERMINAL:
             pass  # already finished; leave untouched
         elif status == 'queued':
-            connection.execute("UPDATE jobs SET status='cancelled',cancel_requested=1,updated=? WHERE id=?",
-                               (_now(), job_id))
+            update_job(connection, job_id, {'status': 'cancelled', 'cancel_requested': 1, 'termination_status': 'cancelled'})
         else:
             # starting/admitting without a session may still be admitted by a worker, so only
             # request cancellation; the worker observes cancel_requested and finalizes.
-            connection.execute("UPDATE jobs SET status='cancelling',cancel_requested=1,updated=? WHERE id=?",
-                               (_now(), job_id))
+            update_job(connection, job_id, {'status': 'cancelling', 'cancel_requested': 1,
+                                          'termination_status': row.get('termination_status') or target_status})
 
     if status in TERMINAL or status == 'queued' or not row.get('session_id'):
         _call(notify)
@@ -377,7 +486,8 @@ def cancel_job(store, native, notify, job_id):
     abort_error, evidence, outcome = _abort_and_reconcile(
         store, native, job_id, row['session_id'], row.get('workspace'))
     _call(notify)
-    return _brief(store.get(job_id), abort_confirmed=abort_error is None, outcome=outcome,
+    return _brief(store.get(job_id), abort_confirmed=bool(evidence.get('termination_confirmed')), outcome=outcome,
+                  abort_acknowledged=evidence.get('abort_acknowledged'),
                   native_idle=bool(evidence.get('native_idle')),
                   note='Native abort is best-effort; OS descendants are not claimed stopped.')
 
@@ -411,7 +521,7 @@ def _inspect_view(row, evidence):
         next_action = 'wait'
     else:
         next_action = 'inspect'
-    retryable = status in ('failed', 'timed_out') and not unknown_admission and not final_complete
+    retryable = False  # Transport retryability never authorizes whole-task replay.
     error_text = raw_error
     if not error_text and last_error:
         try:
@@ -435,13 +545,15 @@ def _plan_reattach(store, job_id):
     status = row['status']
     sid, workspace = row.get('session_id'), row.get('workspace')
     unknown = status in ('starting', 'admitting') and not sid
-    eligible = bool(sid and workspace and status not in TERMINAL and not unknown)
+    eligible = bool(sid and workspace and status not in TERMINAL and not unknown and not row.get('cancel_requested'))
     if eligible:
         reason = 'eligible'
     elif unknown:
         reason = 'unknown admission; never replay'
     elif status in TERMINAL:
         reason = 'already terminal'
+    elif row.get('cancel_requested'):
+        reason = 'termination requested; inspect or abort instead of reattaching execution'
     else:
         reason = 'no admitted session'
     return {'job_id': job_id, 'eligible': eligible, 'reason': reason, 'status': status,
@@ -467,18 +579,17 @@ def recover_job(store, native, notify, job_id, action='inspect'):
                 connection.execute('BEGIN IMMEDIATE')
                 fresh = dict(connection.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
                 if fresh['status'] not in TERMINAL:
-                    connection.execute(
-                        "UPDATE jobs SET cancel_requested=1,status='cancelling',updated=? WHERE id=?",
-                        (_now(), job_id))
+                    update_job(connection, job_id, {'cancel_requested': 1, 'status': 'cancelling'})
             _call(notify)
             return _inspect_view(dict(store.get(job_id)), None) | {
                 'aborted': False, 'reason': 'no admitted session to abort'}
         with store.connect() as connection:
-            connection.execute('UPDATE jobs SET cancel_requested=1 WHERE id=?', (job_id,))
+            connection.execute('BEGIN IMMEDIATE')
+            update_job(connection, job_id, {'cancel_requested': 1})
         abort_error, evidence, outcome = _abort_and_reconcile(store, native, job_id, sid, workspace)
         _call(notify)
         return _inspect_view(dict(store.get(job_id)), evidence) | {
-            'aborted': abort_error is None, 'outcome': outcome, 'abort_error': abort_error}
+            'aborted': bool(evidence.get('termination_confirmed')), 'outcome': outcome, 'abort_error': abort_error}
     evidence = _session_evidence(native, sid, workspace) if sid else None
     return _inspect_view(row, evidence)
 

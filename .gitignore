@@ -24,6 +24,8 @@
 !deploy.py
 !test_bridge.py
 !verify_live.py
+!verify_native.py
+!test_incident.py
 !Install.ps1
 !Bridge.ps1
 !scripts/

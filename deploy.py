@@ -40,7 +40,8 @@ def main():
                     break
     target.mkdir(parents=True, exist_ok=True)
     for name in ['bridge.py', 'control_plane.py', 'artifacts.py', 'workflow.py', 'test_workflow.py', 'test_bridge.py',
-                 'test_control_plane.py', 'test_artifacts.py', 'test_integration.py', 'verify_live.py', 'deploy.py']:
+                 'test_control_plane.py', 'test_artifacts.py', 'test_integration.py', 'test_incident.py',
+                 'verify_native.py', 'verify_live.py', 'deploy.py']:
         destination = target / name
         if destination.resolve() != (source / name).resolve():
             shutil.copy2(source / name, destination)

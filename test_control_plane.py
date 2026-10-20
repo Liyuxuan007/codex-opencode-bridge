@@ -37,6 +37,7 @@ class FakeStore:
         with self.connect() as connection:
             connection.execute('PRAGMA journal_mode=WAL')
             connection.execute(SCHEMA)
+            control_plane.migrate_job_state(connection)
 
     @contextlib.contextmanager
     def connect(self):
@@ -56,15 +57,9 @@ class FakeStore:
         return dict(row)
 
     def update(self, job_id, *, touch=True, **values):
-        allowed = {'status', 'session_id', 'workspace', 'base_commit', 'result', 'error',
-                   'cancel_requested', 'started', 'progress'}
-        if not values.keys() <= allowed:
-            raise ValueError('Invalid update field.')
-        if touch:
-            values['updated'] = time.time()
         with self.connect() as connection:
-            connection.execute('UPDATE jobs SET ' + ','.join(k + '=?' for k in values) + ' WHERE id=?',
-                               [*values.values(), job_id])
+            connection.execute('BEGIN IMMEDIATE')
+            control_plane.update_job(connection, job_id, values, touch=touch)
 
     def add(self, job_id, status='running', session_id=None, workspace='/test/ws', model='opencode-go/test'):
         spec = {'project': '/test/project', 'task': 't', 'owner': 'test', 'model': model,
